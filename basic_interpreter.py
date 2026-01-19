@@ -1,5 +1,6 @@
 import sys, re, os, math, random, time
 import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 from matplotlib.patches import Circle
 try:
     import msvcrt
@@ -7,25 +8,44 @@ except ImportError:
     msvcrt = None
 
 # Compiled Regexes for Optimization
-RE_LET = re.compile(r'([A-Z0-9_$]+)\((.+)\)$')
-RE_DIM = re.compile(r'([A-Z0-9_$]+)\((.+)\)')
+RE_LET = re.compile(r'([A-Z0-9_$]+)\s*\(\s*(.+)\s*\)$')
+RE_DIM = re.compile(r'([A-Z0-9_$]+)\s*\(\s*(.+)\s*\)')
 RE_IF_EQ = re.compile(r'(?<![<>!=])=(?!=)')
 RE_VAR_STR = re.compile(r'\b([A-Z][A-Z0-9_]*)\$')
 RE_INKEY = re.compile(r'\bINKEY_STR\b')
 RE_DATA_SPLIT = re.compile(r',(?=(?:[^"]*"[^"]*")*[^"]*$)')
-RE_OPS = [(re.compile(r'\bAND\b'), ' and '), (re.compile(r'\bOR\b'), ' or '), 
-          (re.compile(r'\bNOT\b'), ' not '), (re.compile(r'<>'), '!=')]
+RE_OPS_COMBINED = re.compile(r'\b(AND|OR|NOT)\b|(<>)')
+RE_RENUM_GOTO = re.compile(r'\b(GOTO|GOSUB)\s+(\d+)', re.IGNORECASE)
+RE_RENUM_THEN = re.compile(r'(\bTHEN\s+)(\d+)', re.IGNORECASE)
 
-class BasicList(list):
-    """List subclass allowing access via () for BASIC array compatibility."""
-    def __call__(self, i): return self[int(i)]
+class BasicArray:
+    """Array class supporting multiple dimensions."""
+    def __init__(self, dims, is_str=False):
+        self.dims = dims
+        self.bounds = [d + 1 for d in dims]
+        total_size = math.prod(self.bounds) if self.bounds else 0
+        self.data = [("" if is_str else 0)] * total_size
+        
+        # Simplified multiplier calculation for row-major order
+        self.multipliers = [1] * len(self.dims)
+        for i in range(len(self.dims) - 2, -1, -1):
+            self.multipliers[i] = self.multipliers[i + 1] * self.bounds[i + 1]
+
+    def _idx(self, args):
+        if len(args) != len(self.dims): raise Exception("Dimension mismatch")
+        idx = 0
+        for i in range(len(args)):
+            idx += int(args[i]) * self.multipliers[i]
+        return idx
+    def __call__(self, *args): return self.data[self._idx(args)]
+    def __setitem__(self, key, value): self.data[self._idx(key if isinstance(key, tuple) else (key,))] = value
 
 class PrintCommand:
     """Handles the PRINT command."""
     def execute(self, i, a):
         """Executes the PRINT command."""
         try: print(i.evaluate(a) if a else "")
-        except Exception as e: print(f"Error: {e}")
+        except Exception: print("Print Error")
 
 class LetCommand:
     """Handles variable assignment (LET)."""
@@ -40,11 +60,13 @@ class LetCommand:
             if m:
                 n, idx = m.groups()
                 if n.endswith('$'): n = n[:-1] + "_STR"
-                i.variables[n][int(i.evaluate(idx))] = v
+                indices = i.evaluate(idx)
+                if not isinstance(indices, tuple): indices = (indices,)
+                i.variables[n][indices] = v
             else:
                 if l.endswith('$'): l = l[:-1] + "_STR"
                 i.variables[l] = v
-        except Exception as e: print(f"Error: {e}")
+        except Exception: print("Assignment Error")
 
 class InputCommand:
     """Handles user input (INPUT)."""
@@ -58,7 +80,7 @@ class InputCommand:
             print(p if idx == 0 else "? ", end='', flush=True)
             val = input()
             try: val = float(val) if '.' in val else int(val)
-            except: pass
+            except: val = 0
             if v.endswith('$'): v = v[:-1] + "_STR"
             i.variables[v] = val
 
@@ -70,7 +92,9 @@ class DimCommand:
         if m:
             n, s = m.groups()
             if n.endswith('$'): n = n[:-1] + "_STR"
-            try: i.variables[n] = BasicList([("" if n.endswith("_STR") else 0)] * (int(i.evaluate(s)) + 1))
+            try:
+                dims = [int(i.evaluate(x.strip())) for x in RE_DATA_SPLIT.split(s)]
+                i.variables[n] = BasicArray(dims, n.endswith("_STR"))
             except Exception as e: print(f"Error: {e}")
 
 class GotoCommand:
@@ -94,20 +118,20 @@ class IfCommand:
         """Executes the IF command."""
         if "THEN" in a:
             c, t = a.split("THEN", 1)
-            if i.evaluate(RE_IF_EQ.sub('==', c)): return int(t)
+            if i.evaluate(c): return int(t)
 
 class ForCommand:
     """Initiates a FOR loop."""
     def execute(self, i, a):
         """Executes the FOR command."""
-        s = 1
-        if "STEP" in a: a, s_str = a.split("STEP"); s = int(i.evaluate(s_str))
+        s = 1.0
+        if "STEP" in a: a, s_str = a.split("STEP"); s = float(i.evaluate(s_str))
         if "TO" in a and "=" in a:
             v_part, e_part = a.split("TO")
             v, start = v_part.split("=")
             v = v.strip()
-            i.variables[v] = int(i.evaluate(start))
-            i.loop_stack.append({'v': v, 'e': int(i.evaluate(e_part)), 's': s, 'l': i.sorted_lines[i.pc_index + 1]})
+            i.variables[v] = float(i.evaluate(start))
+            i.loop_stack.append({'v': v, 'e': float(i.evaluate(e_part)), 's': s, 'l': i.sorted_lines[i.pc_index + 1]})
 
 class NextCommand:
     """Ends a FOR loop step (NEXT)."""
@@ -136,7 +160,10 @@ class PauseCommand:
     """Pauses execution for a specified duration (PAUSE)."""
     def execute(self, i, a):
         """Executes the PAUSE command."""
-        try: time.sleep(float(i.evaluate(a)))
+        try:
+            sec = float(i.evaluate(a))
+            if i.ax and plt: plt.pause(sec)
+            else: time.sleep(sec)
         except Exception as e: print(f"Error: {e}")
 
 class PlotCommand:
@@ -166,6 +193,25 @@ class CircleCommand:
             x, y, r = map(i.evaluate, a.split(','))
             i.ax.add_patch(Circle((x, y), r, color='k', fill=False))
 
+class SpriteCommand:
+    """Handles sprite creation and movement (SPRITE id, x, y, [color])."""
+    def execute(self, i, a):
+        """Executes the SPRITE command."""
+        if not i.ax: return
+        parts = [x.strip() for x in a.split(',')]
+        if len(parts) < 3: return
+        try:
+            sid = int(i.evaluate(parts[0]))
+            x, y = i.evaluate(parts[1]), i.evaluate(parts[2])
+            c = parts[3].strip('"') if len(parts) > 3 else 'r'
+            if sid in i.sprites:
+                i.sprites[sid].set_data([x], [y])
+                if len(parts) > 3: i.sprites[sid].set_color(c)
+            else:
+                l, = i.ax.plot([x], [y], marker='o', color=c, markersize=10)
+                i.sprites[sid] = l
+        except Exception as e: print(f"Error: {e}")
+
 class ReadCommand:
     """Reads values from DATA statements (READ)."""
     def execute(self, i, a):
@@ -193,6 +239,7 @@ class BasicInterpreter:
         self.variables = {}
         self.loop_stack = []
         self.return_stack = []
+        self.sprites = {}
         self.data_values = []
         self.data_ptr = 0
         self.plt = self.fig = self.ax = None
@@ -201,7 +248,7 @@ class BasicInterpreter:
             'GOTO': GotoCommand(), 'GOSUB': GosubCommand(), 'RETURN': ReturnCommand(), 'IF': IfCommand(),
             'FOR': ForCommand(), 'NEXT': NextCommand(), 'CLS': ClsCommand(), 'END': EndCommand(),
             'STOP': EndCommand(), 'REM': EndCommand(), 'PLOT': PlotCommand(), 'DRAW': DrawCommand(), 'CIRCLE': CircleCommand(),
-            'READ': ReadCommand(), 'DATA': DataCommand(), 'PAUSE': PauseCommand()
+            'READ': ReadCommand(), 'DATA': DataCommand(), 'PAUSE': PauseCommand(), 'SPRITE': SpriteCommand()
         }
         self.cmds['REM'].execute = lambda i, a: None
         self.reset_variables()
@@ -212,7 +259,8 @@ class BasicInterpreter:
             'STR_STR': lambda n: (" " + str(n) if float(n) >= 0 else str(n)) if isinstance(n, (int, float)) else str(n),
             'INT': lambda n: int(float(n)), 'LEN': len, 'VAL': float, 'CHR_STR': chr, 'ASC': ord,
             'SIN': math.sin, 'COS': math.cos, 'RND': lambda n: random.random(),
-            'INPUT_STR': self._input_char, 'INKEY_FN': self._inkey
+            'INPUT_STR': self._input_char, 'INKEY_FN': self._inkey,
+            'COLLIDE': self._collide
         }
 
     def _input_char(self, n):
@@ -227,29 +275,77 @@ class BasicInterpreter:
             return msvcrt.getch().decode('utf-8', 'ignore')
         return ""
 
+    def _collide(self, id1, id2):
+        """Checks if two sprites are colliding."""
+        try:
+            id1, id2 = int(id1), int(id2)
+            if id1 not in self.sprites or id2 not in self.sprites: return 0
+            x1, y1 = self.sprites[id1].get_data()
+            x2, y2 = self.sprites[id2].get_data()
+            dist = math.sqrt((x1[0] - x2[0])**2 + (y1[0] - y2[0])**2)
+            return 1 if dist < 15 else 0
+        except: return 0
+
     def renum(self):
-        """Renumbers program lines."""
+        """Renumbers program lines using regex for robustness."""
         old_lines = sorted(self.lines.keys())
         if not old_lines: return
         mapping = {old: 10 + i * 10 for i, old in enumerate(old_lines)}
+        
+        def replace_goto(m):
+            target = int(m.group(2))
+            return f"{m.group(1)} {mapping.get(target, target)}"
+
+        def replace_then(m):
+            target = int(m.group(2))
+            return f"{m.group(1)}{mapping.get(target, target)}"
+
         new_lines = {}
-        for old in old_lines:
-            line = self.lines[old]
-            parts = line.strip().split(" ", 1)
-            cmd = parts[0].upper()
-            if cmd in ["GOTO", "GOSUB"] and len(parts) > 1:
-                try:
-                    target = int(parts[1].strip())
-                    if target in mapping: line = f"{cmd} {mapping[target]}"
-                except: pass
-            elif cmd == "IF" and "THEN" in line:
-                p, t = line.split("THEN", 1)
-                try:
-                    target = int(t.strip())
-                    if target in mapping: line = f"{p}THEN {mapping[target]}"
-                except: pass
-            new_lines[mapping[old]] = line
+        for old_line_num in old_lines:
+            line = self.lines[old_line_num]
+            line = RE_RENUM_GOTO.sub(replace_goto, line)
+            line = RE_RENUM_THEN.sub(replace_then, line)
+            new_lines[mapping[old_line_num]] = line
         self.lines = new_lines
+
+    def save_program(self, filename):
+        """Saves the current program to a file."""
+        try:
+            with open(filename, 'w') as f:
+                for line_num in sorted(self.lines.keys()):
+                    f.write(f"{line_num} {self.lines[line_num]}\n")
+            print(f"Saved to {filename}")
+        except Exception as e:
+            print(f"Error saving file: {e}")
+
+    def load_program(self, filename):
+        """Loads a program from a file."""
+        try:
+            with open(filename, 'r') as f:
+                self.lines.clear()
+                self.reset_variables()
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    parts = line.split(" ", 1)
+                    if parts[0].isdigit() and len(parts) > 1:
+                        self.lines[int(parts[0])] = parts[1]
+                print(f"Loaded from {filename}")
+        except FileNotFoundError:
+            print(f"Error: File not found - {filename}")
+        except Exception as e:
+            print(f"Error loading file: {e}")
+
+    def load_image(self, filename):
+        """Loads and displays a JPEG image."""
+        try:
+            img = mpimg.imread(filename)
+            if not self.ax: # Create plot if it doesn't exist
+                self.fig, self.ax = plt.subplots(); self.ax.set_xlim(0, 320); self.ax.set_ylim(200, 0); self.ax.set_aspect('equal')
+            self.ax.imshow(img, extent=[0, 320, 200, 0])
+            if self.fig: plt.show(block=False); plt.pause(0.01)
+        except FileNotFoundError: print(f"Error: Image file not found - {filename}")
+        except Exception as e: print(f"Error loading image: {e}")
 
     def repl(self):
         """Read-Eval-Print Loop for immediate mode."""
@@ -268,11 +364,24 @@ class BasicInterpreter:
 
     def exec_cmd(self, c, l):
         """Executes immediate commands like RUN, LIST, NEW."""
-        if c == "LIST": [print(f"{k} {self.lines[k]}") for k in sorted(self.lines)]
+        if c == "LIST":
+            for k in sorted(self.lines):
+                print(f"{k} {self.lines[k]}")
         elif c == "NEW": self.lines.clear(); self.reset_variables(); plt.close('all') if plt else None
         elif c == "RUN": self.run()
         elif c == "CLS": os.system('cls' if os.name == 'nt' else 'clear')
         elif c == "RENUM": self.renum()
+        elif c == "SAVE":
+            match = re.search(r'"([^"]+)"', l)
+            if match: self.save_program(match.group(1))
+            else: print("?SYNTAX ERROR")
+        elif c == "LOAD":
+            match = re.search(r'"([^"]+)"', l)
+            if match:
+                filename = match.group(1)
+                if filename.lower().endswith(('.jpg', '.jpeg')): self.load_image(filename)
+                else: self.load_program(filename)
+            else: print("?SYNTAX ERROR")
         elif c in ["BYE", "EXIT"]: sys.exit(0)
         else: print("?")
 
@@ -291,6 +400,7 @@ class BasicInterpreter:
         self.loop_stack.clear()
         self.return_stack.clear()
         self.sorted_lines = sorted(self.lines)
+        self.sprites = {}
         
         self.data_values = []
         self.data_ptr = 0
@@ -329,16 +439,34 @@ class BasicInterpreter:
     def preprocess_expr(self, expr):
         """Preprocesses BASIC expressions into Python syntax."""
         # Fix: Include underscore in variable names and return the modified string 'e'
-        e = RE_VAR_STR.sub(r'\1_STR', expr)
-        e = RE_INKEY.sub('INKEY_FN()', e)
-        for p, r in RE_OPS: e = p.sub(r, e)
-        return e
+        def replace_ops(m): return f" {m.group(1).lower()} " if m.group(1) else "!="
+
+        if '"' not in expr:
+            e = expr
+            e = RE_VAR_STR.sub(r'\1_STR', e)
+            e = RE_INKEY.sub('INKEY_FN()', e)
+            e = RE_OPS_COMBINED.sub(replace_ops, e)
+            e = RE_IF_EQ.sub('==', e)
+            return e
+
+        tokens = re.split(r'("[^"]*")', expr)
+        result = []
+        for idx, token in enumerate(tokens):
+            if idx % 2 == 1: result.append(token)
+            else:
+                e = token
+                e = RE_VAR_STR.sub(r'\1_STR', e)
+                e = RE_INKEY.sub('INKEY_FN()', e)
+                e = RE_OPS_COMBINED.sub(replace_ops, e)
+                e = RE_IF_EQ.sub('==', e)
+                result.append(e)
+        return "".join(result)
 
     def evaluate(self, expr):
         """Evaluates a BASIC expression."""
         py_expr = self.preprocess_expr(expr)
         try: return eval(py_expr, {}, self.variables)
-        except: raise Exception("Eval Error")
+        except Exception: raise Exception("Eval Error")
 
 if __name__ == "__main__":
     interpreter = BasicInterpreter()
