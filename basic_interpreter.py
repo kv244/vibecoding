@@ -1,10 +1,20 @@
-import sys, re, os, math, random
+import sys, re, os, math, random, time
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 try:
     import msvcrt
 except ImportError:
     msvcrt = None
+
+# Compiled Regexes for Optimization
+RE_LET = re.compile(r'([A-Z0-9_$]+)\((.+)\)$')
+RE_DIM = re.compile(r'([A-Z0-9_$]+)\((.+)\)')
+RE_IF_EQ = re.compile(r'(?<![<>!=])=(?!=)')
+RE_VAR_STR = re.compile(r'\b([A-Z][A-Z0-9_]*)\$')
+RE_INKEY = re.compile(r'\bINKEY_STR\b')
+RE_DATA_SPLIT = re.compile(r',(?=(?:[^"]*"[^"]*")*[^"]*$)')
+RE_OPS = [(re.compile(r'\bAND\b'), ' and '), (re.compile(r'\bOR\b'), ' or '), 
+          (re.compile(r'\bNOT\b'), ' not '), (re.compile(r'<>'), '!=')]
 
 class BasicList(list):
     """List subclass allowing access via () for BASIC array compatibility."""
@@ -24,7 +34,7 @@ class LetCommand:
         if "=" not in a: return
         l, r = a.split("=", 1)
         l, r = l.strip(), r.strip()
-        m = re.match(r'([A-Z0-9_$]+)\((.+)\)$', l)
+        m = RE_LET.match(l)
         try:
             v = i.evaluate(r)
             if m:
@@ -56,7 +66,7 @@ class DimCommand:
     """Handles array dimensioning (DIM)."""
     def execute(self, i, a):
         """Executes the DIM command."""
-        m = re.match(r'([A-Z0-9_$]+)\((.+)\)', a)
+        m = RE_DIM.match(a)
         if m:
             n, s = m.groups()
             if n.endswith('$'): n = n[:-1] + "_STR"
@@ -84,7 +94,7 @@ class IfCommand:
         """Executes the IF command."""
         if "THEN" in a:
             c, t = a.split("THEN", 1)
-            if i.evaluate(re.sub(r'(?<![<>!=])=(?!=)', '==', c)): return int(t)
+            if i.evaluate(RE_IF_EQ.sub('==', c)): return int(t)
 
 class ForCommand:
     """Initiates a FOR loop."""
@@ -122,6 +132,13 @@ class EndCommand:
     """Terminates program execution."""
     def execute(self, i, a): return -1
 
+class PauseCommand:
+    """Pauses execution for a specified duration (PAUSE)."""
+    def execute(self, i, a):
+        """Executes the PAUSE command."""
+        try: time.sleep(float(i.evaluate(a)))
+        except Exception as e: print(f"Error: {e}")
+
 class PlotCommand:
     """Plots a single point on the graphics window."""
     def execute(self, i, a):
@@ -149,6 +166,25 @@ class CircleCommand:
             x, y, r = map(i.evaluate, a.split(','))
             i.ax.add_patch(Circle((x, y), r, color='k', fill=False))
 
+class ReadCommand:
+    """Reads values from DATA statements (READ)."""
+    def execute(self, i, a):
+        """Executes the READ command."""
+        for v in [x.strip() for x in a.split(',') if x.strip()]:
+            if i.data_ptr >= len(i.data_values):
+                print("Error: Out of data")
+                return -1
+            val = i.data_values[i.data_ptr]
+            i.data_ptr += 1
+            if v.endswith('$'): i.variables[v[:-1] + "_STR"] = val
+            else:
+                try: i.variables[v] = float(val) if '.' in val else int(val)
+                except: print(f"Error: expected number for {v}"); return -1
+
+class DataCommand:
+    """Defines data values (DATA)."""
+    def execute(self, i, a): pass
+
 class BasicInterpreter:
     """Main interpreter class managing state and execution."""
     def __init__(self):
@@ -157,12 +193,15 @@ class BasicInterpreter:
         self.variables = {}
         self.loop_stack = []
         self.return_stack = []
+        self.data_values = []
+        self.data_ptr = 0
         self.plt = self.fig = self.ax = None
         self.cmds = {
             'PRINT': PrintCommand(), 'LET': LetCommand(), 'INPUT': InputCommand(), 'DIM': DimCommand(),
             'GOTO': GotoCommand(), 'GOSUB': GosubCommand(), 'RETURN': ReturnCommand(), 'IF': IfCommand(),
             'FOR': ForCommand(), 'NEXT': NextCommand(), 'CLS': ClsCommand(), 'END': EndCommand(),
-            'STOP': EndCommand(), 'REM': EndCommand(), 'PLOT': PlotCommand(), 'DRAW': DrawCommand(), 'CIRCLE': CircleCommand()
+            'STOP': EndCommand(), 'REM': EndCommand(), 'PLOT': PlotCommand(), 'DRAW': DrawCommand(), 'CIRCLE': CircleCommand(),
+            'READ': ReadCommand(), 'DATA': DataCommand(), 'PAUSE': PauseCommand()
         }
         self.cmds['REM'].execute = lambda i, a: None
         self.reset_variables()
@@ -173,7 +212,7 @@ class BasicInterpreter:
             'STR_STR': lambda n: (" " + str(n) if float(n) >= 0 else str(n)) if isinstance(n, (int, float)) else str(n),
             'INT': lambda n: int(float(n)), 'LEN': len, 'VAL': float, 'CHR_STR': chr, 'ASC': ord,
             'SIN': math.sin, 'COS': math.cos, 'RND': lambda n: random.random(),
-            'INPUT_STR': self._input_char
+            'INPUT_STR': self._input_char, 'INKEY_FN': self._inkey
         }
 
     def _input_char(self, n):
@@ -181,6 +220,36 @@ class BasicInterpreter:
         r = ""
         for _ in range(int(n)): r += msvcrt.getch().decode('utf-8', 'ignore') if msvcrt else sys.stdin.read(1)
         return r
+
+    def _inkey(self):
+        """Checks for a key press and returns it, or empty string."""
+        if msvcrt and msvcrt.kbhit():
+            return msvcrt.getch().decode('utf-8', 'ignore')
+        return ""
+
+    def renum(self):
+        """Renumbers program lines."""
+        old_lines = sorted(self.lines.keys())
+        if not old_lines: return
+        mapping = {old: 10 + i * 10 for i, old in enumerate(old_lines)}
+        new_lines = {}
+        for old in old_lines:
+            line = self.lines[old]
+            parts = line.strip().split(" ", 1)
+            cmd = parts[0].upper()
+            if cmd in ["GOTO", "GOSUB"] and len(parts) > 1:
+                try:
+                    target = int(parts[1].strip())
+                    if target in mapping: line = f"{cmd} {mapping[target]}"
+                except: pass
+            elif cmd == "IF" and "THEN" in line:
+                p, t = line.split("THEN", 1)
+                try:
+                    target = int(t.strip())
+                    if target in mapping: line = f"{p}THEN {mapping[target]}"
+                except: pass
+            new_lines[mapping[old]] = line
+        self.lines = new_lines
 
     def repl(self):
         """Read-Eval-Print Loop for immediate mode."""
@@ -203,6 +272,7 @@ class BasicInterpreter:
         elif c == "NEW": self.lines.clear(); self.reset_variables(); plt.close('all') if plt else None
         elif c == "RUN": self.run()
         elif c == "CLS": os.system('cls' if os.name == 'nt' else 'clear')
+        elif c == "RENUM": self.renum()
         elif c in ["BYE", "EXIT"]: sys.exit(0)
         else: print("?")
 
@@ -221,15 +291,29 @@ class BasicInterpreter:
         self.loop_stack.clear()
         self.return_stack.clear()
         self.sorted_lines = sorted(self.lines)
+        
+        self.data_values = []
+        self.data_ptr = 0
+        self.program = [] # Pre-parsed program: list of (command, arg)
+
+        for ln in self.sorted_lines:
+            p = self.lines[ln].strip().split(" ", 1)
+            cmd_name = p[0].upper()
+            arg = p[1] if len(p) > 1 else ""
+            if cmd_name == "DATA":
+                for x in RE_DATA_SPLIT.split(arg):
+                    x = x.strip()
+                    self.data_values.append(x[1:-1] if x.startswith('"') and x.endswith('"') else x)
+            self.program.append((self.cmds.get(cmd_name), arg))
+
         # Optimization: Map line numbers to indices for O(1) jumps
         self.line_map = {line: idx for idx, line in enumerate(self.sorted_lines)}
         self.pc_index = 0
         
-        while self.pc_index < len(self.sorted_lines):
-            ln = self.sorted_lines[self.pc_index]
-            p = self.lines[ln].strip().split(" ", 1)
-            cmd = self.cmds.get(p[0].upper())
-            nxt = cmd.execute(self, p[1] if len(p) > 1 else "") if cmd else None
+        n_lines = len(self.program)
+        while self.pc_index < n_lines:
+            cmd, arg = self.program[self.pc_index]
+            nxt = cmd.execute(self, arg) if cmd else None
             
             if nxt == -1:
                 break
@@ -245,9 +329,9 @@ class BasicInterpreter:
     def preprocess_expr(self, expr):
         """Preprocesses BASIC expressions into Python syntax."""
         # Fix: Include underscore in variable names and return the modified string 'e'
-        e = re.sub(r'\b([A-Z][A-Z0-9_]*)\$', r'\1_STR', expr)
-        for k, v in {'AND': ' and ', 'OR': ' or ', 'NOT': ' not ', '<>': '!='}.items():
-            e = re.sub(rf'\b{k}\b' if k.isalpha() else k, v, e)
+        e = RE_VAR_STR.sub(r'\1_STR', expr)
+        e = RE_INKEY.sub('INKEY_FN()', e)
+        for p, r in RE_OPS: e = p.sub(r, e)
         return e
 
     def evaluate(self, expr):
