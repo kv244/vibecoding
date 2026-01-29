@@ -3,7 +3,7 @@ import google.generativeai as genai
 from PIL import Image
 
 # 1. Configure with your API key
-genai.configure(api_key="AIzaSyD9f6Dlo_t1j88xGwvwLI9eKqoJFjo83ko")
+genai.configure(api_key="")
 
 # 2. List available models
 print("Available models:")
