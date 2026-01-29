@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 import google.generativeai as genai
 
 # Configure Gemini with your API key
-genai.configure(api_key="AIzaSyD9f6Dlo_t1j88xGwvwLI9eKqoJFjo83ko")
+genai.configure(api_key="")
 
 # Default to Gemini 2.5 (flash variant if available)
 DEFAULT_MODEL = "models/gemini-2.5-flash"
