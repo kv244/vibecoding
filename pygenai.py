@@ -1,7 +1,7 @@
 import subprocess, time, PIL.Image
 import google.generativeai as genai
 
-genai.configure(api_key="AIzaSyDWEoHyGo1wuyWnDk16VrUj731ZN9Yq4")
+genai.configure(api_key="")
 
 
 for m in genai.list_models():
