@@ -1,4 +1,4 @@
-import pygame
+import pyray as pr
 import numpy as np
 import math
 from typing import List, Tuple, Any
@@ -39,7 +39,9 @@ def init_cube(s: float) -> Tuple[np.ndarray, List[List[int]], List[Tuple[int, in
     ]
     return v, f, e
 
-# Optional high-performance backends
+# ---------------------------------------------------------
+# BACKEND DETECTION
+# ---------------------------------------------------------
 HAS_NUMBA = False
 try:
     from numba import njit
@@ -54,12 +56,18 @@ try:
     HAS_TORCH = True
     if torch.cuda.is_available():
         DEVICE = "cuda"
+        print(f"Check: CUDA is available. Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("Check: CUDA is NOT available. Falling back to CPU.")
 except ImportError:
+    print("Check: PyTorch not installed.")
     pass
 
+# ---------------------------------------------------------
+# CPU / NUMBA FUNCTIONS
+# ---------------------------------------------------------
 @njit
-def get_rotation_matrix(ax: float, ay: float, az: float) -> np.ndarray:
-    """Calculates the 3D rotation matrix using Numba JIT for native performance."""
+def get_rotation_matrix_cpu(ax: float, ay: float, az: float) -> np.ndarray:
     c = np.cos(np.array([ax, ay, az]))
     s = np.sin(np.array([ax, ay, az]))
     
@@ -78,8 +86,7 @@ def get_rotation_matrix(ax: float, ay: float, az: float) -> np.ndarray:
     return rz @ ry @ rx
 
 @njit
-def fast_project(rotated_vertices: np.ndarray, focal_length: float, distance: float, width: int, height: int) -> np.ndarray:
-    """Performs perspective projection using Numba JIT."""
+def fast_project_cpu(rotated_vertices: np.ndarray, focal_length: float, distance: float, width: int, height: int) -> np.ndarray:
     tx = rotated_vertices[:, 0]
     ty = rotated_vertices[:, 1]
     tz = rotated_vertices[:, 2]
@@ -88,18 +95,15 @@ def fast_project(rotated_vertices: np.ndarray, focal_length: float, distance: fl
     sx = (width // 2) + tx * k
     sy = (height // 2) - ty * k
     
-    # Manually stack for Numba compatibility if needed, though column_stack works in modern numba
     res = np.empty((len(tx), 2))
     res[:, 0] = sx
     res[:, 1] = sy
     return res
 
 @njit
-def get_face_shading(rotated_vertices: np.ndarray, faces: np.ndarray, light_dir: np.ndarray) -> np.ndarray:
-    """Calculates shading for each face based on light direction."""
+def get_face_shading_cpu(rotated_vertices: np.ndarray, faces: np.ndarray, light_dir: np.ndarray) -> np.ndarray:
     shading = np.zeros(len(faces))
     for i in range(len(faces)):
-        # Calculate normal using cross product of two edges
         v0 = rotated_vertices[faces[i, 0]]
         v1 = rotated_vertices[faces[i, 1]]
         v2 = rotated_vertices[faces[i, 2]]
@@ -107,99 +111,202 @@ def get_face_shading(rotated_vertices: np.ndarray, faces: np.ndarray, light_dir:
         edge1 = v1 - v0
         edge2 = v2 - v0
         
-        # Manual cross product for Numba
         normal = np.array([
             edge1[1] * edge2[2] - edge1[2] * edge2[1],
             edge1[2] * edge2[0] - edge1[0] * edge2[2],
             edge1[0] * edge2[1] - edge1[1] * edge2[0]
         ])
         
-        # Normalize
         norm = np.sqrt(np.sum(normal**2))
         if norm > 0:
             normal = normal / norm
             
-        # Dot product with light
         dot = np.sum(normal * light_dir)
-        shading[i] = max(0.1, dot) # Ambient floor
+        shading[i] = max(0.1, dot)
     return shading
 
+# ---------------------------------------------------------
+# GPU / TORCH FUNCTIONS
+# ---------------------------------------------------------
+def get_rotation_matrix_torch(ax, ay, az, device):
+    """PyTorch implementation of rotation matrix."""
+    ax_t = torch.tensor(ax, device=device)
+    ay_t = torch.tensor(ay, device=device)
+    az_t = torch.tensor(az, device=device)
+    
+    c = torch.cos(torch.stack([ax_t, ay_t, az_t]))
+    s = torch.sin(torch.stack([ax_t, ay_t, az_t]))
+
+    rx = torch.tensor([[1.0, 0.0, 0.0],
+                       [0.0, c[0], -s[0]],
+                       [0.0, s[0], c[0]]], device=device)
+    
+    ry = torch.tensor([[c[1], 0.0, s[1]],
+                       [0.0, 1.0, 0.0],
+                       [-s[1], 0.0, c[1]]], device=device)
+    
+    rz = torch.tensor([[c[2], -s[2], 0.0],
+                       [s[2], c[2], 0.0],
+                       [0.0, 0.0, 1.0]], device=device)
+
+    # Matmul in torch
+    return torch.matmul(rz, torch.matmul(ry, rx))
+
+def get_face_shading_torch(rotated_vertices, faces, light_dir):
+    """Vectorized shading calculation on GPU."""
+    # Gather vertices for all faces at once
+    # faces shape: [num_faces, 4]
+    # v0, v1, v2 shape: [num_faces, 3]
+    v0 = rotated_vertices[faces[:, 0]]
+    v1 = rotated_vertices[faces[:, 1]]
+    v2 = rotated_vertices[faces[:, 2]]
+    
+    edge1 = v1 - v0
+    edge2 = v2 - v0
+    
+    # Cross product
+    normal = torch.cross(edge1, edge2, dim=1)
+    
+    # Normalize
+    norm = torch.norm(normal, dim=1, keepdim=True)
+    # Avoid division by zero
+    normal = torch.where(norm > 0, normal / norm, normal)
+    
+    # Dot product with light
+    # normal: [num_faces, 3], light_dir: [3]
+    dot = torch.matmul(normal, light_dir)
+    return torch.clamp(dot, min=0.1)
+
+def fast_project_torch(rotated_vertices, focal_length, distance, width, height):
+    tx = rotated_vertices[:, 0]
+    ty = rotated_vertices[:, 1]
+    tz = rotated_vertices[:, 2]
+    
+    k = focal_length / (tz + distance)
+    sx = (width // 2) + tx * k
+    sy = (height // 2) - ty * k
+    
+    return torch.stack([sx, sy], dim=1)
+
+
 def main() -> None:
-    """Main animation loop with GPU/Native acceleration."""
-    pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption(f"3D Cube - Backend: {'CUDA' if DEVICE == 'cuda' else 'Numba' if HAS_NUMBA else 'NumPy'}")
-    clock = pygame.time.Clock()
+    global DEVICE
+    # Initialize Raylib
+    pr.init_window(WIDTH, HEIGHT, f"3D Cube - Backend: {'CUDA' if DEVICE == 'cuda' else 'Numba' if HAS_NUMBA else 'NumPy'}")
+    pr.set_target_fps(FPS)
 
     vertices_np, faces_list, edges = init_cube(SIZE)
     faces_np = np.array(faces_list)
     light_dir = np.array([0.5, 0.5, -1.0])
     light_dir = light_dir / np.linalg.norm(light_dir)
     
-    # Prepare PyTorch if available
+    # GPU Tensors Initialization
     vertices_torch = None
-    if HAS_TORCH:
-        vertices_torch = torch.from_numpy(vertices_np).float().to(DEVICE)
+    faces_torch = None
+    light_dir_torch = None
+    
+    if HAS_TORCH and DEVICE == 'cuda':
+        try:
+            vertices_torch = torch.from_numpy(vertices_np).float().to(DEVICE)
+            faces_torch = torch.tensor(faces_list, dtype=torch.long, device=DEVICE)
+            light_dir_torch = torch.from_numpy(light_dir).float().to(DEVICE)
+            print("PyTorch Tensors initialized on GPU.")
+        except Exception as e:
+            print(f"Failed to initialize CUDA tensors: {e}")
+            # global DEVICE # Not needed in this scope as we are reading it or it's module level
+            DEVICE = 'cpu' # Fallback
 
-    ax, ay, az = 1.0, 1.0, 0.0 # Better start angle
+    ax, ay, az = 1.0, 1.0, 0.0
     dax, day, daz = 0.017, 0.021, 0.013
 
-    running = True
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            # Interactive Controls
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_UP: dax += 0.005
-                if event.key == pygame.K_DOWN: dax -= 0.005
-                if event.key == pygame.K_LEFT: day -= 0.005
-                if event.key == pygame.K_RIGHT: day += 0.005
-                if event.key == pygame.K_SPACE: dax, day, daz = 0, 0, 0 # Stop rotation
+    bg_color = pr.Color(10, 10, 20, 255)
 
-        screen.fill((10, 10, 20)) # Dark blue background
-        rotation_mat_np = get_rotation_matrix(ax, ay, az)
-        
-        # CPU Rotation
-        rotated = vertices_np @ rotation_mat_np.T
-        
-        # Shading
-        if HAS_NUMBA:
-            shading = get_face_shading(rotated, faces_np, light_dir)
-            projected_points = fast_project(rotated, FOCAL_LENGTH, DISTANCE, WIDTH, HEIGHT)
+    while not pr.window_should_close():
+        # Input
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_UP): dax += 0.005
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_DOWN): dax -= 0.005
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_LEFT): day -= 0.005
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_RIGHT): day += 0.005
+        if pr.is_key_pressed(pr.KeyboardKey.KEY_SPACE): dax, day, daz = 0, 0, 0
+
+        # DATA PROCESSING BRANCH
+        if DEVICE == 'cuda':
+            # --- GPU PATH ---
+            rot_mat = get_rotation_matrix_torch(ax, ay, az, DEVICE)
+            rotated_t = torch.matmul(vertices_torch, rot_mat.T)
+            
+            shading_t = get_face_shading_torch(rotated_t, faces_torch, light_dir_torch)
+            projected_t = fast_project_torch(rotated_t, FOCAL_LENGTH, DISTANCE, WIDTH, HEIGHT)
+            
+            # Sort faces (Z-sort) on CPU for now as it's easier to iterate
+            # Technically we could sort on GPU but transferring a small list of indices is fast
+            
+            # Transfer required data to CPU for drawing
+            # We need: projected points, shading values, and efficient face drawing
+            projected_points = projected_t.cpu().numpy()
+            shading = shading_t.cpu().numpy()
+            
+            # For sorting we need Z separation
+            # Calculate mean Z per face
+            # Gather Z values: [num_faces, 4]
+            z_vals = rotated_t[faces_torch, 2] 
+            z_avg = torch.mean(z_vals, dim=1)
+            z_avg_cpu = z_avg.cpu().numpy()
+            
+            # Create the list for sorting
+            face_z = []
+            for i in range(len(faces_list)):
+                face_z.append((z_avg_cpu[i], i))
+
         else:
-            # Fallback (simplified)
-            shading = np.ones(len(faces_np)) * 0.5
-            tx, ty, tz = rotated.T
-            k = FOCAL_LENGTH / (tz + DISTANCE)
-            sx = (WIDTH // 2) + tx * k
-            sy = (HEIGHT // 2) - ty * k
-            projected_points = np.column_stack((sx, sy))
+            # --- CPU/NUMBA PATH ---
+            rotation_mat_np = get_rotation_matrix_cpu(ax, ay, az)
+            rotated = vertices_np @ rotation_mat_np.T
+            
+            if HAS_NUMBA:
+                shading = get_face_shading_cpu(rotated, faces_np, light_dir)
+                projected_points = fast_project_cpu(rotated, FOCAL_LENGTH, DISTANCE, WIDTH, HEIGHT)
+            else:
+                # Fallback Pure NumPy
+                shading = np.ones(len(faces_np)) * 0.5
+                tx, ty, tz = rotated.T
+                k = FOCAL_LENGTH / (tz + DISTANCE)
+                sx = (WIDTH // 2) + tx * k
+                sy = (HEIGHT // 2) - ty * k
+                projected_points = np.column_stack((sx, sy))
+                
+            # Face Sorting
+            face_z = []
+            for i, face in enumerate(faces_list):
+                z_avg = np.mean(rotated[face, 2])
+                face_z.append((z_avg, i))
 
-        # Face Sorting (Painters Algorithm for solid fill)
-        face_z = []
-        for i, face in enumerate(faces_list):
-            z_avg = np.mean(rotated[face, 2])
-            face_z.append((z_avg, i))
-        
-        # Sort faces: furthest first
+        # Sort Faces
         face_z.sort(key=lambda x: x[0], reverse=True)
 
-        # Draw the solid faces
+        # RENDER
+        pr.begin_drawing()
+        pr.clear_background(bg_color)
+
         for _, i in face_z:
             face = faces_list[i]
-            points = [projected_points[v] for v in face]
+            points = [pr.Vector2(projected_points[v][0], projected_points[v][1]) for v in face]
             s = shading[i]
-            color = (int(100 * s), int(150 * s), int(255 * s)) # Gradient blue
-            pygame.draw.polygon(screen, color, points)
-            # Optional: Draw edges with slightly lighter color
-            pygame.draw.polygon(screen, (min(255, color[0] + 50), min(255, color[1] + 50), min(255, color[2] + 50)), points, 1)
+            
+            r, g, b = int(100 * s), int(150 * s), int(255 * s)
+            face_color = pr.Color(r, g, b, 255)
+            edge_color = pr.Color(min(255, r + 50), min(255, g + 50), min(255, b + 50), 255)
 
-        pygame.display.flip()
+            pr.draw_triangle_fan(points, len(points), face_color)
+            for j in range(len(points)):
+                pr.draw_line_v(points[j], points[(j+1)%len(points)], edge_color)
+
+        pr.draw_fps(10, 10)
+        pr.end_drawing()
+
         ax += dax; ay += day; az += daz
-        clock.tick(FPS)
 
-    pygame.quit()
+    pr.close_window()
 
 if __name__ == "__main__":
     main()
