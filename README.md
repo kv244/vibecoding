@@ -23,7 +23,13 @@ A professional-grade image gallery designed for the **Pimoroni Presto**.
 A series of evolutional scripts integrating Google's **Gemini AI** with live webcam feeds:
 - [**pygenai.py**](pygenai.py): The foundation. Simple frame capture via `ffmpeg` analyzed by Gemini Pro.
 - [**pygenai2.py**](pygenai2.py): Adds intelligent model selection, automatically preferring the faster **Gemini Flash** variants if available.
-- [**pygenai3.py**](pygenai3.py): The most advanced version. It features **dynamic hardware zoom control** (via `v4l2-ctl`), automatic timestamp overlays using **Pillow**, and detailed analytical prompts that ask Gemini to interpret how different zoom levels affect context and composition.
+- [**pygenai3.py**](pygenai3.py): The **AI Reasoning Engine**. This is a sophisticated monitor featuring:
+    - **Risk Assessment**: Detects hazards (fire, intruders) with severity levels and suggested actions.
+    - **Fact of Interest Engine**: Identifies specific objects and explains them.
+    - **Temporal Memory**: Remembers past events to summarize state changes.
+    - **Adaptive Zoom**: Dynamic hardware zoom orchestration via the AI's recommendations.
+    - **Visual Overlays**: Real-time rendering of AI insights directly onto the captured frames.
+    - **Structured Data**: Uses JSON schemas for high-reliability AI-to-Code communication.
 
 ---
 
