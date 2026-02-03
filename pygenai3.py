@@ -135,8 +135,15 @@ class GeminiAdvancedMonitor:
         Multimodal reasoning engine: Risk, Facts, and Temporal Context.
         """
         history_context = "\n".join(list(self.history))
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         prompt = f"""
         Analyze this webcam frame with high-level reasoning.
+        
+        ENVIRONMENTAL CONTEXT:
+        - Current Local Time: {current_time}
+        - Note: If it is night time, account for low visibility, infrared noise, or artificial lighting.
+
         CONTEXT (Past Events):
         {history_context if history_context else "Monitoring started."}
 
