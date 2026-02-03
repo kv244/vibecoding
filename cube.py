@@ -10,10 +10,11 @@ FOCAL_LENGTH = 350
 DISTANCE = 400
 SIZE = 80
 
-def init_cube(s: float) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+def init_cube(s: float) -> Tuple[np.ndarray, List[List[int]], List[Tuple[int, int]]]:
     """
     Returns a tuple containing:
     - A NumPy array of vertex coordinates.
+    - A list of lists representing face (vertex indices).
     - A list of tuples representing edge connections.
     """
     v = np.array([
@@ -21,12 +22,22 @@ def init_cube(s: float) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
         [-s, -s, s], [s, -s, s], [s, s, s], [-s, s, s]
     ], dtype=float)
     
+    # Faces defined by vertex indices (counter-clockwise)
+    f = [
+        [0, 1, 2, 3], # Back
+        [4, 5, 6, 7], # Front
+        [0, 4, 7, 3], # Left
+        [1, 5, 6, 2], # Right
+        [0, 1, 5, 4], # Bottom
+        [3, 2, 6, 7]  # Top
+    ]
+    
     e = [
         (0,1), (1,2), (2,3), (3,0),
         (4,5), (5,6), (6,7), (7,4),
         (0,4), (1,5), (2,6), (3,7)
     ]
-    return v, e
+    return v, f, e
 
 # Optional high-performance backends
 HAS_NUMBA = False
@@ -83,6 +94,36 @@ def fast_project(rotated_vertices: np.ndarray, focal_length: float, distance: fl
     res[:, 1] = sy
     return res
 
+@njit
+def get_face_shading(rotated_vertices: np.ndarray, faces: np.ndarray, light_dir: np.ndarray) -> np.ndarray:
+    """Calculates shading for each face based on light direction."""
+    shading = np.zeros(len(faces))
+    for i in range(len(faces)):
+        # Calculate normal using cross product of two edges
+        v0 = rotated_vertices[faces[i, 0]]
+        v1 = rotated_vertices[faces[i, 1]]
+        v2 = rotated_vertices[faces[i, 2]]
+        
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        
+        # Manual cross product for Numba
+        normal = np.array([
+            edge1[1] * edge2[2] - edge1[2] * edge2[1],
+            edge1[2] * edge2[0] - edge1[0] * edge2[2],
+            edge1[0] * edge2[1] - edge1[1] * edge2[0]
+        ])
+        
+        # Normalize
+        norm = np.sqrt(np.sum(normal**2))
+        if norm > 0:
+            normal = normal / norm
+            
+        # Dot product with light
+        dot = np.sum(normal * light_dir)
+        shading[i] = max(0.1, dot) # Ambient floor
+    return shading
+
 def main() -> None:
     """Main animation loop with GPU/Native acceleration."""
     pygame.init()
@@ -90,14 +131,17 @@ def main() -> None:
     pygame.display.set_caption(f"3D Cube - Backend: {'CUDA' if DEVICE == 'cuda' else 'Numba' if HAS_NUMBA else 'NumPy'}")
     clock = pygame.time.Clock()
 
-    vertices_np, edges = init_cube(SIZE)
+    vertices_np, faces_list, edges = init_cube(SIZE)
+    faces_np = np.array(faces_list)
+    light_dir = np.array([0.5, 0.5, -1.0])
+    light_dir = light_dir / np.linalg.norm(light_dir)
     
     # Prepare PyTorch if available
     vertices_torch = None
     if HAS_TORCH:
         vertices_torch = torch.from_numpy(vertices_np).float().to(DEVICE)
 
-    ax, ay, az = 0.0, 0.0, 0.0
+    ax, ay, az = 1.0, 1.0, 0.0 # Better start angle
     dax, day, daz = 0.017, 0.021, 0.013
 
     running = True
@@ -105,41 +149,51 @@ def main() -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            # Interactive Controls
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_UP: dax += 0.005
+                if event.key == pygame.K_DOWN: dax -= 0.005
+                if event.key == pygame.K_LEFT: day -= 0.005
+                if event.key == pygame.K_RIGHT: day += 0.005
+                if event.key == pygame.K_SPACE: dax, day, daz = 0, 0, 0 # Stop rotation
 
-        screen.fill((0, 0, 0))
+        screen.fill((10, 10, 20)) # Dark blue background
         rotation_mat_np = get_rotation_matrix(ax, ay, az)
         
-        if DEVICE == "cuda":
-            # GPU Acceleration via PyTorch
-            rot_torch = torch.from_numpy(rotation_mat_np).float().to(DEVICE)
-            # rotated = vertices @ rotation_mat.T
-            rotated = torch.mm(vertices_torch, rot_torch.t())
-            
-            tx = rotated[:, 0]
-            ty = rotated[:, 1]
-            tz = rotated[:, 2]
-            
+        # CPU Rotation
+        rotated = vertices_np @ rotation_mat_np.T
+        
+        # Shading
+        if HAS_NUMBA:
+            shading = get_face_shading(rotated, faces_np, light_dir)
+            projected_points = fast_project(rotated, FOCAL_LENGTH, DISTANCE, WIDTH, HEIGHT)
+        else:
+            # Fallback (simplified)
+            shading = np.ones(len(faces_np)) * 0.5
+            tx, ty, tz = rotated.T
             k = FOCAL_LENGTH / (tz + DISTANCE)
             sx = (WIDTH // 2) + tx * k
             sy = (HEIGHT // 2) - ty * k
-            projected_points = torch.stack((sx, sy), dim=1).cpu().numpy()
-        else:
-            # CPU Acceleration via Numba or NumPy
-            rotated = vertices_np @ rotation_mat_np.T
-            if HAS_NUMBA:
-                projected_points = fast_project(rotated, FOCAL_LENGTH, DISTANCE, WIDTH, HEIGHT)
-            else:
-                # Fallback to pure NumPy vectorized (already fast, but not JIT'd)
-                tx, ty, tz = rotated.T
-                k = FOCAL_LENGTH / (tz + DISTANCE)
-                sx = (WIDTH // 2) + tx * k
-                sy = (HEIGHT // 2) - ty * k
-                projected_points = np.column_stack((sx, sy))
+            projected_points = np.column_stack((sx, sy))
 
-        # Draw the wireframe
-        for edge in edges:
-            p1, p2 = projected_points[edge[0]], projected_points[edge[1]]
-            pygame.draw.line(screen, (255, 255, 255), p1, p2, 1)
+        # Face Sorting (Painters Algorithm for solid fill)
+        face_z = []
+        for i, face in enumerate(faces_list):
+            z_avg = np.mean(rotated[face, 2])
+            face_z.append((z_avg, i))
+        
+        # Sort faces: furthest first
+        face_z.sort(key=lambda x: x[0], reverse=True)
+
+        # Draw the solid faces
+        for _, i in face_z:
+            face = faces_list[i]
+            points = [projected_points[v] for v in face]
+            s = shading[i]
+            color = (int(100 * s), int(150 * s), int(255 * s)) # Gradient blue
+            pygame.draw.polygon(screen, color, points)
+            # Optional: Draw edges with slightly lighter color
+            pygame.draw.polygon(screen, (min(255, color[0] + 50), min(255, color[1] + 50), min(255, color[2] + 50)), points, 1)
 
         pygame.display.flip()
         ax += dax; ay += day; az += daz

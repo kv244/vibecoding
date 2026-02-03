@@ -10,6 +10,11 @@ from PIL import Image, ImageDraw, ImageFont
 import google.generativeai as genai
 from typing import Optional, Tuple, List, Dict, Any
 
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -111,7 +116,7 @@ class GeminiAdvancedMonitor:
     def _add_overlay(self, filename: str, zoom: int, insights: Optional[Dict] = None):
         """Overlays timestamp, zoom, and critical alerts onto the image."""
         img = Image.open(filename).convert("RGBA")
-        overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         
         # Font setup
@@ -120,26 +125,32 @@ class GeminiAdvancedMonitor:
 
         ts = datetime.now().strftime("%H:%M:%S")
         
+        # Helper for rounded rectangles/boxes
+        def draw_box(x, y, text, font, fill_color, text_color):
+            bbox = draw.textbbox((x, y), text, font=font)
+            padding = 5
+            draw.rectangle([bbox[0]-padding, bbox[1]-padding, bbox[2]+padding, bbox[3]+padding], fill=fill_color)
+            draw.text((x, y), text, font=font, fill=text_color)
+            return bbox[3] + padding + 5
+
         # 1. Base Info
-        info_text = f"[{ts}] ZOOM: {zoom}"
-        draw.text((20, 20), info_text, font=font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0,0,0,255))
+        y_offset = 20
+        y_offset = draw_box(20, y_offset, f"[{ts}] ZOOM: {zoom}", font, (0, 0, 0, 160), (255, 255, 255, 255))
 
         # 2. Risk Overlays
         if insights and insights.get("risks"):
-            y_offset = 60
             for risk in insights["risks"]:
                 severity = risk["severity"].upper()
                 msg = f"!!! {severity}: {risk['hazard']} !!!"
                 # Red for critical/high, yellow for medium
-                color = (255, 0, 0, 255) if severity in ["CRITICAL", "HIGH"] else (255, 255, 0, 255)
-                draw.text((20, y_offset), msg, font=font, fill=color, stroke_width=2, stroke_fill=(0,0,0,255))
-                y_offset += 35
+                box_color = (200, 0, 0, 200) if severity in ["CRITICAL", "HIGH"] else (200, 200, 0, 200)
+                y_offset = draw_box(20, y_offset, msg, font, box_color, (255, 255, 255, 255))
 
         # 3. Fact Highlights
         if insights and insights.get("interesting_facts"):
             fact = insights["interesting_facts"][0] # Just show first one
-            draw.text((20, img.height - 50), f"FACT: {fact['subject']} - {fact['fact'][:50]}...", 
-                      font=font, fill=(0, 255, 100, 255), stroke_width=1, stroke_fill=(0,0,0,255))
+            draw_box(20, img.height - 60, f"FACT: {fact['subject']} - {fact['fact'][:60]}", 
+                     font, (0, 100, 50, 200), (200, 255, 200, 255))
 
         combined = Image.alpha_composite(img, overlay)
         combined.convert("RGB").save(filename)
@@ -205,6 +216,14 @@ class GeminiAdvancedMonitor:
                 # Apply overlay with insights
                 self._add_overlay(filename, self.current_zoom, insights)
                 
+                # Audio Alerts
+                if winsound and self.alert_enabled and insights.get("risks"):
+                    high_risks = [r for r in insights["risks"] if r["severity"] in ["critical", "high"]]
+                    if high_risks:
+                        winsound.Beep(1000, 500)  # High pitch for danger
+                    elif insights["risks"]:
+                        winsound.Beep(500, 200)   # Lower pitch for info
+
                 # Update Zoom logic
                 next_zoom = insights.get("zoom_recommendation", 100)
                 if next_zoom != self.current_zoom:
