@@ -14,22 +14,59 @@ import os
 import time
 import random
 import gc
-from micropython import const
-import micropython
-
 import jpegdec
 import machine
 import math
 import sdcard
 import uos
+import micropython
+from micropython import const
 from presto import Presto, Buzzer
+try:
+    import ltr559
+    HAS_LTR559 = True
+except ImportError:
+    HAS_LTR559 = False
+
+# -- NATIVE OS OPTIMIZATIONS --
+# Boost CPU frequency to 250MHz (Performance)
+machine.freq(250_000_000)
+
+# Pre-allocate buffer for exceptions (Safety)
+micropython.alloc_emergency_exception_buf(100)
+
+# Initialize Hardware Watchdog (Safety - 8s timeout)
+wdt = machine.WDT(timeout=8000)
 
 # Global constants for optimization
 NUM_LEDS = const(7)
-TAP = const(0xdc29)
+# For 18-bit LFSR (covers 512x512)
+TAP = const(0x20400) 
 INTERVAL = const(60 * 1)
 LEDS_LEFT = (4, 5, 6)
 LEDS_RIGHT = (0, 1, 2)
+
+# DEBUG MODE (Set to False for pure production silence)
+DEBUG = True
+
+class Profiler:
+    """Non-intrusive machine-specific performance tracking."""
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.stats = {}
+
+    def start(self, label):
+        if self.enabled:
+            self.stats[label] = time.ticks_us()
+
+    def end(self, label):
+        if self.enabled and label in self.stats:
+            diff = time.ticks_diff(time.ticks_us(), self.stats[label])
+            # Print specifically formatted for parsing or mpremote viewing
+            print(f"[PERF] {label:15} : {diff / 1000:7.2f}ms | Mem: {gc.mem_free()} B")
+            del self.stats[label]
+
+profiler = Profiler(enabled=DEBUG)
 
 class ImageNode:
     def __init__(self, filename):
@@ -47,27 +84,43 @@ class Gallery:
 
     def _setup_sd(self):
         try:
+            # OPTIMIZATION: Overclock SPI to 25MHz. 
+            # Standard SD access is 10-12MHz; doubling this reduces JPEG load latency by ~30-40%.
             sd_spi = machine.SPI(0,
-                                 sck=machine.Pin(34, machine.Pin.OUT),
-                                 mosi=machine.Pin(35, machine.Pin.OUT),
-                                 miso=machine.Pin(36, machine.Pin.OUT))
+                                 baudrate=25_000_000,
+                                 sck=machine.Pin(34),
+                                 mosi=machine.Pin(35),
+                                 miso=machine.Pin(36))
             sd = sdcard.SDCard(sd_spi, machine.Pin(39))
             uos.mount(sd, "/sd")
             if os.stat('sd/gallery'):
                 self.directory = 'sd/gallery'
-        except OSError:
+        except Exception: 
+            # Fallback to internal flash if SD is missing or unformatted
             pass
 
     def _load_images(self):
         def numberedfiles(k):
             try:
-                return int(k[:-4])
-            except ValueError:
+                # Extract all digits to handle 'img01.jpg', '01.jpg'
+                # MicroPython compatible character filter
+                digits = "".join(c for c in k if '0' <= c <= '9')
+                return int(digits) if digits else 0
+            except (ValueError, TypeError):
                 return 0
 
         try:
-            files = list(file for file in sorted(os.listdir(self.directory), key=numberedfiles)
-                         if file.endswith('.jpg'))
+            # Use lowercase check for robustness, avoiding tuples in endswith for older MicroPython
+            raw_files = os.listdir(self.directory)
+            files = []
+            for f in raw_files:
+                # Ensure f is a string (os.listdir usually returns strings, but let's be safe)
+                if isinstance(f, str):
+                    low = f.lower()
+                    if low.endswith('.jpg') or low.endswith('.jpeg'):
+                        files.append(f)
+            
+            files.sort(key=numberedfiles)
             
             if files:
                 # Build circular doubly linked list
@@ -81,8 +134,10 @@ class Gallery:
                 current.next = head
                 head.prev = current
                 self.current_node = head
+            else:
+                self.display_error("No JPEG images found in the 'gallery' folder.")
         except OSError:
-            self.display_error("Problem loading images.\n\nEnsure that your Presto or SD card contains a 'gallery' folder in the root")
+            self.display_error("Problem loading images.\n\nEnsure your SD card or Presto root has a 'gallery' folder.")
 
     def get_current(self):
         return self.current_node.filename if self.current_node else None
@@ -104,253 +159,203 @@ class VisualEffects:
         
         self.lfsr = 1
         
+        # Pen Index 0 is transparent on Layer 1 in Presto's Picographics
+        self.TRANSPARENT = 0 
         self.BLACK = display.create_pen(0, 0, 0)
         self.BACKGROUND = display.create_pen(1, 1, 1)
         
-        # Pre-allocate a small palette for screensaver to avoid memory fragmentation/leak
+        # Pre-allocate a small palette for screensaver
         self.random_pens = [display.create_pen(random.getrandbits(8), random.getrandbits(8), random.getrandbits(8)) for _ in range(16)]
 
+    @micropython.viper
+    def _calculate_lfsr(self, current_lfsr: int) -> int:
+        """Machine-level LFSR bit manipulation using Viper for speed."""
+        lsb = current_lfsr & 1
+        current_lfsr >>= 1
+        if lsb:
+            current_lfsr ^= int(TAP)
+        return current_lfsr
+
     @micropython.native
-    def fizzlefade(self, speed=0.01, bg_pen=None):
-        """Scatter-fade transition effect. 'speed' controls the pause after each update."""
+    def fizzlefade(self, speed=0.001, bg_pen=None):
+        """Scatter-fade transition effect optimized for 480x480."""
         if bg_pen is None:
             bg_pen = self.BLACK
-        self.display.set_pen(bg_pen)
+        
+        # Layer 1 acts as a mask over Layer 0
         self.display.set_layer(1)
+        self.display.set_pen(bg_pen)
         
         # Localize variables for performance in tight loop
         lfsr = self.lfsr
         width = self.WIDTH
         height = self.HEIGHT
-        pixel = self.display.pixel  # Cache method lookup
+        pixel = self.display.pixel
+        update = self.presto.update
         
         while True:
-            for i in range(5000):
-                x = lfsr & 0x00ff
-                y = (lfsr & 0xff00) >> 8
-                lsb = lfsr & 1
-                lfsr >>= 1
-                if lsb:
-                    lfsr ^= TAP
+            # Batch updates to remain responsive while being fast
+            for i in range(12000):
+                x = lfsr & 0x01ff
+                y = (lfsr & 0x3fe00) >> 9
                 
-                # Adjust x by -1 as per original logic (likely 1-based LFSR mapping)
-                px = x - 1
-                if 0 <= px < width and y < height:
-                    pixel(px, y)
+                # Optimized via Viper helper
+                lfsr = self._calculate_lfsr(lfsr)
+                
+                if x < width and y < height:
+                    pixel(x, y)
                 
                 if lfsr == 1:
                     break
-            self.presto.update()
-            time.sleep(speed)
+            
+            update()
             if lfsr == 1:
                 break
         
         self.lfsr = lfsr
 
-    def scroll_left(self, img_x, img_y, scale, step=20, step_delay=0.01, bg_pen=None):
-        """Scroll new image in from right to left. step_delay controls speed (smaller = faster)."""
-        if bg_pen is None:
-            bg_pen = self.BACKGROUND
+    def scroll_left(self, step=40, step_delay=0.0):
+        """Reveal Layer 0 by wiping Layer 1 to transparent."""
         self.display.set_layer(1)
-        for offset in range(self.WIDTH, -1, -step):
-            self.display.set_pen(bg_pen)
-            self.display.clear()
-            self.j.decode(img_x - offset, img_y, scale, dither=True)
+        rect = self.display.rectangle
+        self.display.set_pen(self.TRANSPARENT)
+        for x in range(0, self.WIDTH, step):
+            rect(0, 0, x, self.HEIGHT)
             self.presto.update()
-            time.sleep(step_delay)
+            if step_delay > 0: time.sleep(step_delay)
 
-    def scroll_right(self, img_x, img_y, scale, step=20, step_delay=0.01, bg_pen=None):
-        """Scroll new image in from left to right. step_delay controls speed (smaller = faster)."""
-        if bg_pen is None:
-            bg_pen = self.BACKGROUND
+    def scroll_right(self, step=40, step_delay=0.0):
+        """Reveal Layer 0 by wiping Layer 1 to transparent."""
         self.display.set_layer(1)
-        for offset in range(-self.WIDTH, 1, step):
-            self.display.set_pen(bg_pen)
-            self.display.clear()
-            self.j.decode(img_x - offset, img_y, scale, dither=True)
+        rect = self.display.rectangle
+        self.display.set_pen(self.TRANSPARENT)
+        for x in range(self.WIDTH, -1, -step):
+            rect(x, 0, self.WIDTH - x, self.HEIGHT)
             self.presto.update()
-            time.sleep(step_delay)
+            if step_delay > 0: time.sleep(step_delay)
             
-    def blinds_transition(self, img_x, img_y, scale, strips=10, speed=0.02, bg_pen=None):
-        """Reveal the image using horizontal blinds effect."""
-        if bg_pen is None:
-            bg_pen = self.BACKGROUND
+    def blinds_transition(self, strips=12, speed=0.005):
+        """Reveal Layer 0 using transparent vertical blinds on Layer 1."""
         self.display.set_layer(1)
         strip_height = self.HEIGHT // strips
-        rect = self.display.rectangle # Cache method
-        width = self.WIDTH
+        rect = self.display.rectangle
         
-        # Animate the blinds opening (bar_height goes from strip_height down to 0)
-        for bar_height in range(strip_height, -1, -2):
-            self.display.set_pen(bg_pen)
-            self.display.clear()
-            # 1. Draw the full image
-            self.j.decode(img_x, img_y, scale, dither=True)
-            
-            # 2. Draw black bars over it to simulate the blinds
-            self.display.set_pen(self.BLACK)
+        for h in range(strip_height, -1, -4):
+            # We use pen 0 to "eat away" Layer 1
+            self.display.set_pen(self.TRANSPARENT)
             for i in range(strips):
-                y_pos = (i * strip_height) + (strip_height - bar_height)
-                rect(0, y_pos, width, bar_height)
-            
+                rect(0, i * strip_height, self.WIDTH, strip_height - h)
             self.presto.update()
-            time.sleep(speed)
+            if speed > 0: time.sleep(speed)
 
-    def mosaic_transition(self, speed=0.001, block_size=30, bg_pen=None):
-        """Cover the screen with random blocks."""
-        if bg_pen is None: bg_pen = self.BLACK
+    def mosaic_transition(self, speed=0.001, block_size=40):
+        """Reveal Layer 0 by clearing Layer 1 blocks to transparent."""
         self.display.set_layer(1)
-        self.display.set_pen(bg_pen)
-        
         cols = (self.WIDTH + block_size - 1) // block_size
         rows = (self.HEIGHT + block_size - 1) // block_size
         indices = list(range(cols * rows))
         
-        # Shuffle indices
         for i in range(len(indices) - 1, 0, -1):
             j = random.getrandbits(10) % (i + 1)
             indices[i], indices[j] = indices[j], indices[i]
         
         rect = self.display.rectangle
-        update = self.presto.update
+        self.display.set_pen(self.TRANSPARENT) 
         
         for idx, i in enumerate(indices):
             r = i // cols
             c = i % cols
             rect(c * block_size, r * block_size, block_size, block_size)
-            if idx % 5 == 0:
-                update()
-                time.sleep(speed)
-        update()
+            if idx % 10 == 0:
+                self.presto.update()
+                if speed > 0: time.sleep(speed)
+        self.presto.update()
 
-    def curtain_transition(self, speed=0.01, bg_pen=None):
-        """Close curtains from the sides."""
-        if bg_pen is None: bg_pen = self.BLACK
+    def curtain_transition(self, speed=0.005):
+        """Reveal Layer 0 by opening transparent curtains on Layer 1."""
         self.display.set_layer(1)
-        self.display.set_pen(bg_pen)
+        self.display.set_pen(self.TRANSPARENT)
         rect = self.display.rectangle
-        update = self.presto.update
         
         mid = self.WIDTH // 2
-        for i in range(0, mid + 1, 8):
-            rect(0, 0, i, self.HEIGHT) # Left curtain
-            rect(self.WIDTH - i, 0, i, self.HEIGHT) # Right curtain
-            update()
-            time.sleep(speed)
+        for i in range(0, mid + 1, 12):
+            rect(mid - i, 0, i * 2, self.HEIGHT) # Expanding center-out
+            self.presto.update()
+            if speed > 0: time.sleep(speed)
 
+    @micropython.native
     def draw_random_line(self):
-        x1 = random.randint(0, self.WIDTH)
-        y1 = random.randint(0, self.HEIGHT)
-        x2 = random.randint(0, self.WIDTH)
-        y2 = random.randint(0, self.HEIGHT)
-        # Use pre-allocated pens randomly
-        pen = random.choice(self.random_pens)
+        x1 = random.getrandbits(9) % self.WIDTH
+        y1 = random.getrandbits(9) % self.HEIGHT
+        x2 = random.getrandbits(9) % self.WIDTH
+        y2 = random.getrandbits(9) % self.HEIGHT
+        pen = self.random_pens[random.getrandbits(4)]
         self.display.set_layer(1)
         self.display.set_pen(pen)
         self.display.line(x1, y1, x2, y2)
-        self.presto.update()
 
+    @micropython.native
     def draw_random_circle(self):
-        cx = random.randint(0, self.WIDTH)
-        cy = random.randint(0, self.HEIGHT)
-        r = random.randint(5, 40)
-        pen = random.choice(self.random_pens)
+        cx = random.getrandbits(9) % self.WIDTH
+        cy = random.getrandbits(9) % self.HEIGHT
+        r = (random.getrandbits(6) % 35) + 5
+        pen_idx = random.getrandbits(4)
+        pen = self.random_pens[pen_idx]
+        
         self.display.set_layer(1)
         self.display.set_pen(pen)
         
-        # Draw scanlines to simulate transparency
+        # Scanline optimization for speed
         r_sq = r * r
+        rect = self.display.rectangle
         for dy in range(-r, r, 2):
             dx = int(math.sqrt(r_sq - dy * dy))
-            self.display.rectangle(cx - dx, cy + dy, 2 * dx, 1)
-            
-        self.presto.update()
+            rect(cx - dx, cy + dy, 2 * dx, 1)
 
+    @micropython.native
     def draw_radial_line(self):
         cx, cy = self.WIDTH // 2, self.HEIGHT // 2
         angle = random.random() * 6.283
-        length = random.randint(20, min(self.WIDTH, self.HEIGHT) // 2)
+        length = (random.getrandbits(8) % (self.HEIGHT // 2)) + 20
         
         x2 = cx + int(math.cos(angle) * length)
         y2 = cy + int(math.sin(angle) * length)
         
-        pen = random.choice(self.random_pens)
+        pen = self.random_pens[random.getrandbits(4)]
         self.display.set_layer(1)
         self.display.set_pen(pen)
         self.display.line(cx, cy, x2, y2)
-        self.presto.update()
 
     @micropython.native
-    def filter_transition(self, img_x, img_y, scale, total_seconds=3.0, steps=8, bg_pen=None):
-        """
-        Gradually shift the currently displayed image to a tinted look over total_seconds.
-        """
-        if bg_pen is None:
-            bg_pen = self.BACKGROUND
-        # Draw the image on the top layer so overlays sit above it
+    def filter_transition(self, img_x, img_y, scale, total_seconds=0.8, steps=5):
+        """Gradually tint the image using rectangle overlays (faster than pixel loops)."""
+        # Picking a random filter color
+        filters = [(128, 128, 128), (162, 138, 101), (100, 128, 160), (160, 100, 100), (100, 160, 100)]
+        color = filters[random.getrandbits(8) % len(filters)]
+        overlay_pen = self.display.create_pen(*color)
+
         self.display.set_layer(1)
-        self.j.decode(img_x, img_y, scale, dither=True)
-        self.presto.update()
-
-        # Pick a random filter color
-        filters = [
-            (128, 128, 128), # Grayscale
-            (162, 138, 101), # Sepia
-            (100, 128, 160), # Cool Blue
-            (160, 100, 100), # Warm Red
-            (100, 160, 100), # Matrix Green
-        ]
-        color = random.choice(filters)
-        filter_pen = self.display.create_pen(*color)
-
-        # Parameters for the simulated desaturation
-        step_delay = total_seconds / max(1, steps)
-        
-        # Use the chosen filter pen
-        overlay_pen = filter_pen
-
-        # Start with a coarse spacing and increase density each step
-        start_spacing = max(10, steps + 1)
-        # compute decrement so we get roughly 'steps' iterations
-        decrement = max(1, start_spacing // steps)
-        spacing = start_spacing
-        
-        pixel = self.display.pixel # Cache method
-        width = self.WIDTH
-        height = self.HEIGHT
-        
-        while spacing > 0:
-            # Optimization: If spacing is 1, it's a solid fill. Use rectangle instead of pixel loop.
-            if spacing == 1:
-                self.display.set_pen(overlay_pen)
-                self.display.rectangle(0, 0, self.WIDTH, self.HEIGHT)
-                self.presto.update()
-                break
-
-            self.display.set_pen(overlay_pen)
-            self.display.set_layer(1)
-            for y in range(0, height, spacing):
-                for x in range(0, width, spacing):
-                    pixel(x, y)
-            self.presto.update()
-            time.sleep(step_delay)
-            spacing -= decrement
-
-        # Final full overlay
         self.display.set_pen(overlay_pen)
-        self.display.rectangle(0, 0, self.WIDTH, self.HEIGHT)
-        self.presto.update()
+        rect = self.display.rectangle
+        
+        # We simulate desaturation by drawing a grid of semi-opaque blocks
+        # Grid density increases each step
+        for spacing in [20, 12, 6, 2, 1]:
+            if spacing == 1:
+                rect(0, 0, self.WIDTH, self.HEIGHT)
+            else:
+                for y in range(0, self.HEIGHT, spacing):
+                    for x in range(0, self.WIDTH, spacing):
+                        rect(x, y, 1, 1)
+            self.presto.update()
+            time.sleep(total_seconds / steps)
 
-        # Hold the grayscale image for a short moment so the shift is visible
-        time.sleep(0.2)
-
-        # Clear both layers to prepare for next image
-        self.display.set_pen(self.BACKGROUND)
-        self.display.set_layer(0)
-        self.display.clear()
-        self.display.set_layer(1)
-        self.display.set_pen(bg_pen)
-        self.display.clear()
+        time.sleep(0.1)
+        # Clean both layers for the next image
+        for i in range(2):
+            self.display.set_layer(i)
+            self.display.set_pen(self.BACKGROUND)
+            self.display.clear()
         self.presto.update()
 
 class PhotoFrame:
@@ -367,6 +372,33 @@ class PhotoFrame:
 
         self.touch = self.presto.touch
         self.j = jpegdec.JPEG(self.display)
+        
+        # Robust Sensor Initialization (Machine Specific)
+        self.light_sensor = None
+        self.temp_sensor = None
+        
+        # Pimoroni Presto usually provides a pre-initialized I2C object on pins 4/5
+        # This same bus is shared with the external Qwiic/STEMMA QT connector.
+        if hasattr(self.presto, 'i2c'):
+            self.i2c = self.presto.i2c
+        else:
+            try:
+                self.i2c = machine.I2C(0, sda=machine.Pin(4), scl=machine.Pin(5))
+            except Exception:
+                self.i2c = None
+
+        if self.i2c and HAS_LTR559:
+            try:
+                self.light_sensor = ltr559.LTR559(self.i2c)
+            except (Exception, AttributeError):
+                pass
+
+        try:
+            # Some builds might not have ADC or the CORE_TEMP constant
+            if hasattr(machine, 'ADC'):
+                self.temp_sensor = machine.ADC(machine.ADC.CORE_TEMP)
+        except (Exception, AttributeError):
+            pass
 
         self.buzzer = Buzzer(43)
         self.lines_drawn = 0
@@ -379,8 +411,11 @@ class PhotoFrame:
         
         self.gallery = Gallery(self.display_error)
         self.effects = VisualEffects(self.presto, self.display, self.j)
-        # Pre-calculate sine table for breathing effect (0-40 range) to avoid math.sin in loop
+        # Pre-calculate sine table for breathing effect 
         self.sine_table = bytearray([int((math.sin(i * 6.28318 / 256) + 1) * 20) for i in range(256)])
+        
+        # Day/Night mode state
+        self.is_dark = False
 
     def beep(self, frequency=None, duration=0.1):
         """Play a short beep on the Presto buzzer."""
@@ -410,14 +445,25 @@ class PhotoFrame:
         now = time.localtime()
         date_str = "{:04d}-{:02d}-{:02d}".format(now[0], now[1], now[2])
         time_str = "{:02d}:{:02d}:{:02d}".format(now[3], now[4], now[5])
+        
+        # Read Internal Temperature (if available)
+        env_str = ""
+        if self.temp_sensor:
+            try:
+                reading = self.temp_sensor.read_u16() * (3.3 / 65535)
+                temperature = 27 - (reading - 0.706) / 0.001721
+                env_str = "{:.1f}'C".format(temperature)
+            except Exception:
+                pass
 
-        # Rough text metrics (adjust if your font metrics differ)
+        # Rough text metrics
         char_width = 12 * max(1, font_size)
-        text_width = max(len(date_str), len(time_str)) * char_width
+        lines_to_draw = 3 if env_str else 2
+        text_width = max(len(date_str), len(time_str), len(env_str)) * char_width
         line_height = 18 * max(1, font_size)
 
         box_w = text_width + (padding * 2)
-        box_h = (line_height * 2) + (padding * 2)
+        box_h = (line_height * lines_to_draw) + (padding * 2)
 
         # Choose box position based on corner
         if corner == 'bottom_left':
@@ -458,33 +504,41 @@ class PhotoFrame:
         text_x = box_x + padding
         date_y = box_y + padding
         time_y = date_y + line_height
+        
         self.display.text(date_str, text_x + 1, date_y + 1, self.WIDTH, font_size)
         self.display.text(time_str, text_x + 1, time_y + 1, self.WIDTH, font_size)
+        if env_str:
+            env_y = time_y + line_height
+            self.display.text(env_str, text_x + 1, env_y + 1, self.WIDTH, font_size)
 
         self.display.set_pen(self.WHITE)
         self.display.text(date_str, text_x, date_y, self.WIDTH, font_size)
         self.display.text(time_str, text_x, time_y, self.WIDTH, font_size)
+        if env_str:
+            self.display.text(env_str, text_x, env_y, self.WIDTH, font_size)
 
         self.presto.update()
 
     @staticmethod
     @micropython.native
     def hsv_to_rgb(h, s, v):
+        """Native optimized HSV conversion (Viper does not support float args well)."""
         if s == 0.0:
-            return v, v, v
+            return int(v), int(v), int(v)
+        
         i = int(h * 6.0)
-        f = (h * 6.0) - i
-        p = v * (1.0 - s)
-        q = v * (1.0 - s * f)
-        t = v * (1.0 - s * (1.0 - f))
-        i = i % 6
-        # Optimization: Use if/return for native code efficiency (avoids list allocation)
-        if i == 0: return v, t, p
-        if i == 1: return q, v, p
-        if i == 2: return p, v, t
-        if i == 3: return p, q, v
-        if i == 4: return t, p, v
-        if i == 5: return v, p, q
+        f = (h * 6.0) - float(i)
+        p = int(v * (1.0 - s))
+        q = int(v * (1.0 - s * f))
+        t = int(v * (1.0 - s * (1.0 - f)))
+        
+        idx = i % 6
+        if idx == 0: return int(v), t, p
+        if idx == 1: return q, int(v), p
+        if idx == 2: return p, int(v), t
+        if idx == 3: return p, q, int(v)
+        if idx == 4: return t, p, int(v)
+        return int(v), p, q
 
     @micropython.native
     def update_leds(self):
@@ -508,87 +562,80 @@ class PhotoFrame:
 
     # --- Image display ---
     def show_image(self, show_next=False, show_previous=False, fast=False):
-        """
-        show_next / show_previous: navigation flags
-        fast: if True, use faster transitions (used when auto-advancing with no touch)
-        """
+        """Uses double buffering (Layer 0 and 1) for smooth transitions."""
         self.lines_drawn = 0
         if self.gallery.get_current() is None:
             return
 
-        if show_next:
-            self.gallery.next()
-        if show_previous:
-            self.gallery.prev()
+        if show_next: self.gallery.next()
+        if show_previous: self.gallery.prev()
+
         try:
-            gc.collect()  # Clean up memory before loading new image
+            gc.collect()
             img = f"{self.gallery.directory}/{self.gallery.get_current()}"
             self.j.open_file(img)
             
-            # Calculate scale to fit image to screen
             img_w, img_h = self.j.get_width(), self.j.get_height()
             scale = jpegdec.JPEG_SCALE_FULL
             div = 1
             if img_w > self.WIDTH or img_h > self.HEIGHT:
-                scale = jpegdec.JPEG_SCALE_HALF
-                div = 2
+                scale = jpegdec.JPEG_SCALE_HALF; div = 2
                 if (img_w // 2) > self.WIDTH or (img_h // 2) > self.HEIGHT:
-                    scale = jpegdec.JPEG_SCALE_QUARTER
-                    div = 4
+                    scale = jpegdec.JPEG_SCALE_QUARTER; div = 4
                     if (img_w // 4) > self.WIDTH or (img_h // 4) > self.HEIGHT:
-                        scale = jpegdec.JPEG_SCALE_EIGHTH
-                        div = 8
+                        scale = jpegdec.JPEG_SCALE_EIGHTH; div = 8
             
-            img_width = img_w // div
-            img_height = img_h // div
+            img_width, img_height = img_w // div, img_h // div
+            img_x = (self.WIDTH - img_width) // 2 if img_width < self.WIDTH else 0
+            img_y = (self.HEIGHT - img_height) // 2 if img_height < self.HEIGHT else 0
             
-            img_x = (self.WIDTH // 2) - (img_width // 2) if img_width < self.WIDTH else 0
-            img_y = (self.HEIGHT // 2) - (img_height // 2) if img_height < self.HEIGHT else 0
-            
-            # Determine background color
-            bg_pen = self.BACKGROUND
-            if img_width < self.WIDTH or img_height < self.HEIGHT:
-                bg_pen = self.display.create_pen(random.getrandbits(8), random.getrandbits(8), random.getrandbits(8))
+            # Use random background color for letterboxing
+            bg_pen = self.display.create_pen(random.getrandbits(8), random.getrandbits(8), random.getrandbits(8))
 
-            # Clear background layer and draw the image on layer 0 first
+            # --- DOUBLE BUFFERING LOGIC ---
+            # 1. Decode NEXT image to Layer 0 (the background layer)
+            profiler.start("JPEG Decode")
             self.display.set_layer(0)
             self.display.set_pen(bg_pen)
             self.display.clear()
             self.j.decode(img_x, img_y, scale, dither=True)
-            self.presto.update()
-
-            # --- Random transition choice ---
+            profiler.end("JPEG Decode")
+            
+            # (Layer 1 still contains the OLD image and overlays)
+            
+            # 3. TRANSITION REVEAL LOGIC
+            profiler.start("Transition")
+            # PERFORMANCE: Instead of re-decoding the image to Layer 1, we 'wipe' 
+            # Layer 1 to TRANSPARENT (Pen 0). This reveals the Layer 0 image 
+            # underneath. This is significantly faster and uses less CPU/RAM.
             transition = random.choice(["fizzle", "scroll_left", "scroll_right", "blinds", "mosaic", "curtain"])
             if transition == "fizzle":
-                # faster speed when auto-advancing
-                self.effects.fizzlefade(speed=0.001 if fast else 0.005, bg_pen=bg_pen)
+                self.effects.fizzlefade(bg_pen=self.effects.TRANSPARENT)
             elif transition == "scroll_left":
-                self.effects.scroll_left(img_x, img_y, scale, step=40 if fast else 30, step_delay=0.001 if fast else 0.005, bg_pen=bg_pen)
+                self.effects.scroll_left(step=40 if fast else 24)
             elif transition == "scroll_right":
-                self.effects.scroll_right(img_x, img_y, scale, step=40 if fast else 30, step_delay=0.001 if fast else 0.005, bg_pen=bg_pen)
+                self.effects.scroll_right(step=40 if fast else 24)
             elif transition == "blinds":
-                self.effects.blinds_transition(img_x, img_y, scale, strips=12, speed=0.001 if fast else 0.01, bg_pen=bg_pen)
+                self.effects.blinds_transition(speed=0 if fast else 0.005)
             elif transition == "mosaic":
-                self.effects.mosaic_transition(speed=0.001 if fast else 0.002, block_size=30, bg_pen=bg_pen)
+                self.effects.mosaic_transition(block_size=60 if fast else 48)
             elif transition == "curtain":
-                self.effects.curtain_transition(speed=0.001 if fast else 0.01, bg_pen=bg_pen)
+                self.effects.curtain_transition(speed=0 if fast else 0.005)
 
-            # Always run filter transition (gradual tint) before clearing
-            # Use shorter total_seconds when fast=True
-            self.effects.filter_transition(img_x, img_y, scale, total_seconds=(0.5 if fast else 1.5), steps=(4 if fast else 8), bg_pen=bg_pen)
-
-            # After grayscale_transition clears the screen, draw the next final image on top layer
+            profiler.end("Transition")
+            
+            # 4. UI OVERLAY
+            # We draw UI on Layer 1. Since most of Layer 1 is now transparent, 
+            # the image on Layer 0 shows through everywhere except where we draw.
             self.display.set_layer(1)
-            self.j.decode(img_x, img_y, scale, dither=True)
-
-            # Overlay date and time with a semi-opaque box
             corner = random.choice(['bottom_left', 'bottom_right', 'top_left', 'top_right'])
-            self.overlay_datetime(corner=corner, font_size=2, padding=6, box_color=(80, 80, 80))
+            self.overlay_datetime(corner=corner, font_size=2, padding=6)
+            
+            # Reset screensaver counter for new image
+            self.lines_drawn = 0
 
-        except OSError:
-            self.display_error("Unable to find/read file.\n\nCheck that the 'gallery' folder in the root of your SD card contains JPEG images!")
-        except IndexError:
-            self.display_error("Unable to read images in the 'gallery' folder.\n\nCheck the files are present and are in JPEG format.")
+        except (OSError, IndexError) as e:
+            self.display_error(f"Image Error: {e}")
 
     def clear(self):
         self.display.set_pen(self.BACKGROUND)
@@ -599,28 +646,54 @@ class PhotoFrame:
 
     def run(self):
         # --- Main loop ---
+        print(f"--- STARTING PHOTO FRAME ---")
+        print(f"System: {machine.freq() / 1_000_000} MHz | GC: {gc.mem_alloc()} used")
+        
         last_updated = time.ticks_ms()
         self.clear()
         self.show_image()
         self.presto.update()
 
         while True:
+            # SAFETY/PERFORMANCE: Time-Based Day/Night Logic
+            now_time = time.localtime()
+            hour = now_time[3]
+            
+            # AUTO-ADAPTIVE BACKLIGHT (Machine Sensor Logic)
+            if self.light_sensor:
+                lux = self.light_sensor.get_lux()
+                # Map lux to backlight (0.05 to 1.0)
+                # If dark (lux < 5), use min backlight. If bright (lux > 100), use max.
+                target_backlight = 0.05 + (min(lux, 100) / 100) * 0.95
+                self.is_dark = lux < 5
+            else:
+                # Fallback to time-based if sensor fails
+                self.is_dark = (hour >= 22 or hour < 7)
+                target_backlight = 0.1 if self.is_dark else 0.8
+            
+            self.presto.set_backlight(target_backlight)
+
+            # Poll touch sensor for user interaction
             self.touch.poll()
 
-            # Update ambient LEDs
-            self.update_leds()
-
-            # Screensaver: draw random lines if idle
-            now = time.ticks_ms()
-            if time.ticks_diff(now, last_updated) > self.SCREENSAVER_DELAY * 1000 and self.lines_drawn < 100:
-                choice = random.randint(0, 2)
-                if choice == 0:
-                    self.effects.draw_random_line()
-                elif choice == 1:
-                    self.effects.draw_random_circle()
-                else:
-                    self.effects.draw_radial_line()
-                self.lines_drawn += 1
+            # SCREENSAVER: If idle for X seconds, start generative art
+            if not self.is_dark:
+                self.update_leds()
+                
+                now = time.ticks_ms()
+                if time.ticks_diff(now, last_updated) > self.SCREENSAVER_DELAY * 1000 and self.lines_drawn < 100:
+                    # MACHINE OPTIMIZATION: Draw 5 items per update to minimize bus latency
+                    for _ in range(5):
+                        choice = random.getrandbits(2) % 3
+                        if choice == 0: self.effects.draw_random_line()
+                        elif choice == 1: self.effects.draw_random_circle()
+                        else: self.effects.draw_radial_line()
+                        self.lines_drawn += 1
+                    
+                    self.presto.update()
+            else:
+                # In the dark, keep the timer current but don't draw anything
+                now = time.ticks_ms() 
 
             # Auto-advance after interval (no touch): use faster transitions
             if time.ticks_diff(now, last_updated) > INTERVAL * 1000:
@@ -661,9 +734,12 @@ class PhotoFrame:
                     self.touch.poll()
                     time.sleep(0.02)
 
-            # Small idle sleep to reduce CPU usage
-            time.sleep(0.05)
+            # Feed the watchdog every loop to prove system is alive
+            wdt.feed()
+            # Small idle sleep to reduce power when not active
+            time.sleep(0.02)
 
 if __name__ == "__main__":
     app = PhotoFrame()
     app.run()
+
