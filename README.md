@@ -26,7 +26,7 @@ A series of evolutional scripts integrating Google's **Gemini AI** with live web
 - [**pygenai3.py**](pygenai3.py): The **AI Reasoning Engine**. This is a sophisticated monitor featuring:
     - **Risk Assessment**: Detects hazards (fire, intruders) with severity levels and suggested actions.
     - **Fact of Interest Engine**: Identifies specific objects and explains them.
-    - **Temporal Memory**: Remembers past events to summarize state changes.
+    - **Temporal Memory & Time/Location Awareness**: Remembers past events and is aware of the current local time and physical location (City/Region) for superior context (e.g., night-time visibility, weather).
     - **Adaptive Zoom**: Dynamic hardware zoom orchestration via the AI's recommendations.
     - **Visual Overlays**: Real-time rendering of AI insights directly onto the captured frames.
     - **Structured Data**: Uses JSON schemas for high-reliability AI-to-Code communication.

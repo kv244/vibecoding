@@ -65,9 +65,23 @@ class GeminiAdvancedMonitor:
         self.current_zoom = 100
         self.is_running = False
         self.history = collections.deque(maxlen=10) # Store last 10 event summaries
+        self.location = self._fetch_location()
         
         # Audio alert toggle (can be expanded to play sound)
         self.alert_enabled = True
+
+    def _fetch_location(self) -> str:
+        """Fetches approximate location at runtime (Cross-platform)."""
+        import urllib.request
+        try:
+            with urllib.request.urlopen("https://ipinfo.io/json") as response:
+                data = json.loads(response.read().decode())
+                loc_str = f"{data.get('city', 'Unknown')}, {data.get('region', 'Unknown')}, {data.get('country', 'Unknown')}"
+                logger.info(f"Runtime Location Detected: {loc_str}")
+                return loc_str
+        except Exception as e:
+            logger.warning(f"Could not fetch location: {e}")
+            return "Unknown Location"
 
     def _set_hardware_zoom(self, value: int):
         """Attempts to set hardware zoom via v4l2-ctl."""
@@ -142,7 +156,9 @@ class GeminiAdvancedMonitor:
         
         ENVIRONMENTAL CONTEXT:
         - Current Local Time: {current_time}
+        - Current Location: {self.location}
         - Note: If it is night time, account for low visibility, infrared noise, or artificial lighting.
+        - Geographic Context: Use the location to infer weather expectations or local daylight patterns.
 
         CONTEXT (Past Events):
         {history_context if history_context else "Monitoring started."}
