@@ -8,6 +8,8 @@ A collection of high-performance animations, vintage interpreters, and AI experi
 **3D Solid Cube Animation**
 A high-performance implementation of a rotating 3D cube using **Pygame**.
 - **What’s interesting:** Now features **Solid Face Rendering** with **Flat Shading** (dynamic lighting) and **Painter's Algorithm** for depth sorting. Optimized with **Numba JIT**. Includes **Interactive Keyboard Controls** (Arrows for speed/direction, Space to stop).
+- ![cube-cuda](https://github.com/user-attachments/assets/f4e4b646-4b87-43b3-a12a-5aa1a933678c)
+
 
 ### 🕹️ [basic_interpreter.py](basic_interpreter.py)
 **Toy BASIC Interpreter with Graphics**
