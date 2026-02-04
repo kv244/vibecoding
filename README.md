@@ -20,8 +20,8 @@ A feature-rich BASIC interpreter written in Python.
 **MicroPython Photo Frame for Presto (RP2350)**
 A professional-grade image gallery designed for the **Pimoroni Presto**.
 - **What’s interesting:** This script features highly optimized MicroPython code, including custom transitions like **FizzleFade**, horizontal blinds, and mosaic transitions. 
-- **Hardware Acceleration:** Uses the RP2350's **PIO (Programmable I/O)** state machines to drive the ambient LED bar with nanosecond precision.
-- **Multithreading:** Offloads LED animations and feedback to **Core 1**, ensuring perfectly smooth lighting even during heavy JPEG decoding on the main core. 
+- **Hardware Acceleration**: Uses the RP2350's **PIO (Programmable I/O)** state machines and **SIO Interpolators** to drive the ambient LED bar and accelerate rendering transitions with nanosecond precision.
+- **Autonomous LEDs**: Offloads LED animations to the **DMA Controller**, providing zero-CPU-overhead "breathing" effects that keep running even during heavy JPEG decoding.
 - **Smart Power**: Features auto-adaptive backlight control using the onboard light sensor.
 
 ### 👁️ AI Webcam Experiments

@@ -22,7 +22,7 @@ import uos
 import micropython
 from presto import Presto, Buzzer
 import rp2
-import _thread
+import uctypes
 import array
 try:
     import ltr559
@@ -56,18 +56,17 @@ LEDS_LEFT = (4, 5, 6)
 LEDS_RIGHT = (0, 1, 2)
 
 # PIO WS2812/SK6812 Driver Program
-@rp2.asm_pio(sideset_init=rp2.PIO.OUT_LOW, out_shiftdir=rp2.PIO.SHIFT_LEFT, autopull=True, pull_thresh=24)
-def ws2812():
-    T1 = 2
-    T2 = 5
-    T3 = 3
+@rp2.asm_pio(sideset_init=rp2.PIO.OUT_LOW, out_shiftdir=rp2.PIO.SHIFT_LEFT, 
+             autopull=True, pull_thresh=24)
+def ws2812_aura():
+    T1, T2, T3 = 2, 5, 3
     wrap_target()
-    label("bitloop")
-    out(x, 1)               .side(0)    [T3 - 1]
-    jmp(not_x, "do_zero")   .side(1)    [T1 - 1]
-    jmp("bitloop")          .side(1)    [T2 - 1]
+    label("bit_loop")
+    out(x, 1)               .side(0) [T3 - 1] 
+    jmp(not_x, "do_zero")   .side(1) [T1 - 1] 
+    jmp("bit_loop")         .side(1) [T2 - 1] 
     label("do_zero")
-    nop()                   .side(0)    [T2 - 1]
+    nop()                   .side(0) [T2 - 1] 
     wrap()
 
 # -- RP2350 DSP & FPU ACCELERATION (Cortex-M33) --
@@ -496,7 +495,6 @@ class PhotoFrame:
         self.buzzer = Buzzer(43)
         self.lines_drawn = 0
         self.SCREENSAVER_DELAY = 10
-        self.led_hue = 0.0
         
         # Pre-calculate pens for overlay to avoid allocation in loop
         self.BOX_PEN = self.display.create_pen(80, 80, 80)
@@ -504,74 +502,63 @@ class PhotoFrame:
         
         self.gallery = Gallery(self.display_error)
         self.effects = VisualEffects(self.presto, self.display, self.j)
-        # Pre-calculate sine table for breathing effect 
-        self.sine_table = bytearray([int((math.sin(i * 6.28318 / 256) + 1) * 20) for i in range(256)])
         
-        # PIO State Machine Setup (GPIO 33, 800kHz bit rate)
-        # We use state machine 4 (PIO 1, SM 0) to avoid potential resource 
-        # conflicts with the display driver which often claims SM 0-3 on PIO 0.
-        # freq=8_000_000 ensures each PIO instruction cycle is 125ns.
-        self.sm = rp2.StateMachine(4, ws2812, freq=8_000_000, sideset_base=machine.Pin(33))
+        # -- Hardware Configuration --
+        self.NUM_LEDS = 7
+        self.LED_PIN = 20  # Presto Aura LEDs
+        self.DMA_CHAN = 11
+        self.PIO_SM_ID = 4  # PIO 1, SM 0
+        
+        # DMA Registers (RP2350)
+        self.DMA_BASE = 0x50000000 + (self.DMA_CHAN * 0x40)
+        self.READ_ADDR = self.DMA_BASE + 0x00
+        self.WRITE_ADDR = self.DMA_BASE + 0x04
+        self.TRANS_COUNT = self.DMA_BASE + 0x08
+        self.CTRL_TRIG = self.DMA_BASE + 0x0C
+        self.PIO_TX_FIFO = 0x50300000 + 0x10 + ((self.PIO_SM_ID % 4) * 4) # PIO1
+        
+        # DMA Control Word (Chain to self for looping)
+        # DREQ_PIO1_TX0 = 8 (for PIO1 SM0)
+        DREQ_PIO1_TX0 = 8
+        self.DMA_CTRL = (DREQ_PIO1_TX0 << 15) | (11 << 11) | (1 << 4) | (2 << 2) | (1 << 0)
+        
+        # -- Animation Buffer --
+        self.ANIM_STEPS = 64
+        self.breath_buffer = array.array('I', [0] * (self.ANIM_STEPS * self.NUM_LEDS))
+        for i in range(self.ANIM_STEPS):
+            brightness = int((math.sin(i * math.pi * 2 / self.ANIM_STEPS) + 1) * 60)
+            color = ((brightness // 2) << 16) | (0 << 8) | brightness
+            packed_color = color << 8
+            for led in range(self.NUM_LEDS):
+                self.breath_buffer[i * self.NUM_LEDS + led] = packed_color
+
+        # PIO Setup
+        self.sm = rp2.StateMachine(self.PIO_SM_ID, ws2812_aura, freq=8_000_000, sideset_base=machine.Pin(self.LED_PIN))
         self.sm.active(1)
         
-        # LED Buffer (7 LEDs * 32-bit GRB)
-        # Using array.array('I') for efficient memory layout and fast FIFO transfer.
-        self.led_data = array.array("I", [0] * NUM_LEDS)
-        
-        # Thread-safe signal for UI feedback (left/right flashes).
-        # This is checked by the LED thread running on Core 1.
-        self.led_trigger = None # 'left', 'right', or None
-        
-        # Offload LED animations to Core 1 to prevent blocking Core 0
-        # which handles the heavy JPEG decoding and screen updates.
-        _thread.start_new_thread(self._led_thread, ())
+        # Start Background Aura
+        self.start_background_aura()
 
-    def _led_thread(self):
-        """
-        Background thread for LED orchestration.
-        Running on Core 1 allows for perfectly smooth animations even
-        during disk I/O and JPEG processing on the main core.
-        """
-        while True:
-            if self.led_trigger == 'right':
-                # User touched the right side: perform a green flash
-                self._send_leds(r=0, g=255, b=0)
-                time.sleep(0.5)
-                self.led_trigger = None
-            elif self.led_trigger == 'left':
-                # User touched the left side: perform a blue flash
-                self._send_leds(r=0, g=0, b=255)
-                time.sleep(0.5)
-                self.led_trigger = None
-            elif not self.is_dark:
-                # Room is lit: continue the ambient rainbow cycle
-                self.update_leds()
-            else:
-                # Dark mode: Turn off LEDs to avoid annoyance
-                self._send_leds(0, 0, 0)
-            
-            # Small yield to allow other background tasks (if any)
-            time.sleep(0.02)
+    def start_background_aura(self):
+        """Configure and start the DMA loop for background LEDs."""
+        mem32 = machine.mem32
+        mem32[self.READ_ADDR] = uctypes.addressof(self.breath_buffer)
+        mem32[self.WRITE_ADDR] = self.PIO_TX_FIFO
+        mem32[self.TRANS_COUNT] = len(self.breath_buffer)
+        mem32[self.CTRL_TRIG] = self.DMA_CTRL | (1 << 1) # EN=1
 
-    def _send_leds(self, r=None, g=None, b=None):
-        """
-        Efficiently pushes color data to the PIO state machine.
-        
-        Args:
-            r, g, b (int): If provided, fills the whole bar with this color.
-                           If None, sends the current content of self.led_data.
-        """
-        if r is not None and g is not None and b is not None:
-            # Construct a 24-bit GRB word (standard for SK6812/WS2812)
-            # Shift left by 8 so the channel data occupies the upper 24 bits 
-            # of the 32-bit FIFO word.
-            val = ((g << 16) | (r << 8) | b) << 8
-            for i in range(NUM_LEDS):
-                self.led_data[i] = val
-        
-        # Flush the buffer to the PIO FIFO.
-        # 'sm.put' pushes the array content to the hardware FIFO.
-        self.sm.put(self.led_data) 
+    def stop_aura_dma(self):
+        """Stop the autonomous DMA transfer."""
+        machine.mem32[self.CTRL_TRIG] &= ~0x1 # Disable EN
+
+    def flash_leds(self, r, g, b, duration=0.2):
+        """Temporary flash overriding the background aura."""
+        self.stop_aura_dma()
+        val = ((g << 16) | (r << 8) | b) << 8
+        for _ in range(self.NUM_LEDS): # Fill the buffer once
+            self.sm.put(val)
+        time.sleep(duration)
+        self.start_background_aura()
 
     def beep(self, frequency=None, duration=0.1):
         """Play a short beep on the Presto buzzer."""
@@ -710,29 +697,6 @@ class PhotoFrame:
         if idx == 4: return t, p, v_int
         return v_int, p, q
 
-    @micropython.native
-    def update_leds(self):
-        """Cycle LEDs through a gentle rainbow."""
-        self.led_hue += 0.01
-        if self.led_hue > 1.0:
-            self.led_hue = 0.0
-            
-        # Calculate pulsating brightness using lookup table (integer math only)
-        # Map time to 0-255 index. Shift right by 4 gives approx 3-4s period
-        intensity = 10 + self.sine_table[(time.ticks_ms() >> 4) & 0xFF]
-
-        # Simple HSV to RGB conversion for the LED bar
-        # Optimize: Avoid list comprehension allocation
-        hr, hg, hb = self.hsv_to_rgb(self.led_hue, 1.0, 1.0)
-        r, g, b = int(hr * intensity), int(hg * intensity), int(hb * intensity)
-        
-        # Update buffer with GRB values (shifted left for MSB-first out)
-        val = ((g << 16) | (r << 8) | b) << 8
-        for i in range(NUM_LEDS):
-            self.led_data[i] = val
-            
-        self._send_leds()
-
     # --- Image display ---
     def show_image(self, show_next=False, show_previous=False, fast=False):
         """Uses double buffering (Layer 0 and 1) for smooth transitions."""
@@ -810,6 +774,16 @@ class PhotoFrame:
         except (OSError, IndexError) as e:
             self.display_error(f"Image Error: {e}")
 
+    def next_image(self, fast=False):
+        self.show_image(show_next=True, fast=fast)
+        self.presto.update()
+        self.last_updated = time.ticks_ms()
+
+    def prev_image(self, fast=False):
+        self.show_image(show_previous=True, fast=fast)
+        self.presto.update()
+        self.last_updated = time.ticks_ms()
+
     def clear(self):
         self.display.set_pen(self.BACKGROUND)
         self.display.set_layer(0)
@@ -822,7 +796,7 @@ class PhotoFrame:
         print(f"--- STARTING PHOTO FRAME ---")
         print(f"System: {machine.freq() / 1_000_000} MHz | GC: {gc.mem_alloc()} used")
         
-        last_updated = time.ticks_ms()
+        self.last_updated = time.ticks_ms()
         self.clear()
         self.show_image()
         self.presto.update()
@@ -851,9 +825,9 @@ class PhotoFrame:
 
             # SCREENSAVER: If idle for X seconds, start generative art
             if not self.is_dark:
-                # The LED thread handles the rainbow cycle automatically
+                # The DMA-driven LEDs handle the background aura automatically
                 now = time.ticks_ms()
-                if time.ticks_diff(now, last_updated) > self.SCREENSAVER_DELAY * 1000 and self.lines_drawn < 100:
+                if time.ticks_diff(now, self.last_updated) > self.SCREENSAVER_DELAY * 1000 and self.lines_drawn < 100:
                     # MACHINE OPTIMIZATION: Draw 5 items per update to minimize bus latency
                     for _ in range(5):
                         choice = random.getrandbits(2) % 3
@@ -866,12 +840,12 @@ class PhotoFrame:
             else:
                 # In the dark, keep the timer current but don't draw anything
                 now = time.ticks_ms() 
+                self.stop_aura_dma() # Turn off LEDs in dark mode
 
             # Auto-advance after interval (no touch): use faster transitions
-            if time.ticks_diff(now, last_updated) > INTERVAL * 1000:
-                last_updated = time.ticks_ms()
-                self.show_image(show_next=True, fast=True)
-                self.presto.update()
+            if time.ticks_diff(now, self.last_updated) > INTERVAL * 1000:
+                self.last_updated = time.ticks_ms()
+                self.next_image(fast=True)
                 # Double beep cue for auto-advance with random frequencies
                 self.beep(None, 0.05)
                 time.sleep(0.05)
@@ -880,20 +854,13 @@ class PhotoFrame:
             # Handle touch input
             if self.touch.state:
                 if self.touch.x > self.WIDTH // 2:   # right side → next image
-                    self.beep(None, 0.1)        # random-frequency beep
-                    self.led_trigger = 'right' # Signal LED thread
-                    self.show_image(show_next=True, fast=False)
-                    self.presto.update()
-                    last_updated = time.ticks_ms()
-                    time.sleep(0.01)
-
-                elif self.touch.x < self.WIDTH // 2: # left side → previous image
-                    self.beep(None, 0.1)         # random-frequency beep
-                    self.led_trigger = 'left' # Signal LED thread
-                    self.show_image(show_previous=True, fast=False)
-                    self.presto.update()
-                    last_updated = time.ticks_ms()
-                    time.sleep(0.01)
+                    self.beep(880, 0.05)
+                    self.flash_leds(0, 255, 0) # Green flash
+                    self.next_image()
+                else:                                # left side → previous image
+                    self.beep(660, 0.05)
+                    self.flash_leds(0, 0, 255) # Blue flash
+                    self.prev_image()
 
                 # Wait for touch release to avoid multiple triggers
                 while self.touch.state:
