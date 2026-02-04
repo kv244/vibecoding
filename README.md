@@ -6,8 +6,8 @@ A collection of high-performance animations, vintage interpreters, and AI experi
 
 ### 🧊 [cube.py](cube.py)
 **3D Solid Cube Animation**
-A high-performance implementation of a rotating 3D cube using **Pygame**.
-- **What’s interesting:** Now features **Solid Face Rendering** with **Flat Shading** (dynamic lighting) and **Painter's Algorithm** for depth sorting. Optimized with **Numba JIT**. Includes **Interactive Keyboard Controls** (Arrows for speed/direction, Space to stop).
+A high-performance implementation of a rotating 3D cube with **Adaptive Backend Selection**.
+- **What’s interesting:** Now features a modular backend system that automatically selects the fastest available path: **PyTorch (CUDA GPU)**, **Numba (CPU JIT)**, or **Pure NumPy**. Includes **Solid Face Rendering** with **Flat Shading** (dynamic lighting) and **Painter's Algorithm** for depth sorting. Features **Interactive Keyboard Controls** (Arrows for speed/direction, Space to stop).
 - ![cube-cuda](https://github.com/user-attachments/assets/f4e4b646-4b87-43b3-a12a-5aa1a933678c)
 
 
@@ -17,9 +17,12 @@ A feature-rich BASIC interpreter written in Python.
 - **What’s interesting:** It’s not just a parser; it includes support for subroutines (`GOSUB`/`RETURN`), data handling (`DATA`/`READ`), and even sprite-based collision detection. It uses **Matplotlib** as a graphics engine, allowing you to `PLOT`, `DRAW`, and `CIRCLE` directly from BASIC code. It even supports loading JPEG images into the background!
 
 ### 🖼️ [image_gallery2_vibe.py](image_gallery2_vibe.py)
-**MicroPython Photo Frame for Presto**
+**MicroPython Photo Frame for Presto (RP2350)**
 A professional-grade image gallery designed for the **Pimoroni Presto**.
-- **What’s interesting:** This script features highly optimized MicroPython code, including custom transitions like **FizzleFade** (using a Linear Feedback Shift Register for pseudo-random pixel scattering), horizontal blinds, and mosaic transitions. It manages images via a circular doubly linked list and includes a "breathing" LED effect using pre-calculated sine tables to avoid floating-point overhead in real-time.
+- **What’s interesting:** This script features highly optimized MicroPython code, including custom transitions like **FizzleFade**, horizontal blinds, and mosaic transitions. 
+- **Hardware Acceleration:** Uses the RP2350's **PIO (Programmable I/O)** state machines to drive the ambient LED bar with nanosecond precision.
+- **Multithreading:** Offloads LED animations and feedback to **Core 1**, ensuring perfectly smooth lighting even during heavy JPEG decoding on the main core. 
+- **Smart Power**: Features auto-adaptive backlight control using the onboard light sensor.
 
 ### 👁️ AI Webcam Experiments
 A series of evolutional scripts integrating Google's **Gemini AI** with live webcam feeds:

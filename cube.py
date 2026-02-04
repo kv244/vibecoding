@@ -3,12 +3,12 @@ import numpy as np
 import math
 from typing import List, Tuple, Any
 
-# Configuration
+# -- CONFIGURATION & RENDERING PARAMETERS --
 WIDTH, HEIGHT = 640, 512
 FPS = 60
-FOCAL_LENGTH = 350
-DISTANCE = 400
-SIZE = 80
+FOCAL_LENGTH = 350 # Controls the perspective 'zoom'
+DISTANCE = 400     # Distance from camera to cube center
+SIZE = 80          # Cube half-side length
 
 def init_cube(s: float) -> Tuple[np.ndarray, List[List[int]], List[Tuple[int, int]]]:
     """
@@ -40,13 +40,16 @@ def init_cube(s: float) -> Tuple[np.ndarray, List[List[int]], List[Tuple[int, in
     return v, f, e
 
 # ---------------------------------------------------------
-# BACKEND DETECTION
+# BACKEND DETECTION & ACCELERATION
 # ---------------------------------------------------------
+# We check for Numba (CPU JIT) and PyTorch (GPU CUDA) to select the fastest path.
+
 HAS_NUMBA = False
 try:
     from numba import njit
     HAS_NUMBA = True
 except ImportError:
+    # No-op decorator if Numba is missing
     def njit(func): return func
 
 HAS_TORCH = False
@@ -129,7 +132,10 @@ def get_face_shading_cpu(rotated_vertices: np.ndarray, faces: np.ndarray, light_
 # GPU / TORCH FUNCTIONS
 # ---------------------------------------------------------
 def get_rotation_matrix_torch(ax, ay, az, device):
-    """PyTorch implementation of rotation matrix."""
+    """
+    Constructs a 3D rotation matrix using PyTorch tensors.
+    Combines rotations around X, Y, and Z axes.
+    """
     ax_t = torch.tensor(ax, device=device)
     ay_t = torch.tensor(ay, device=device)
     az_t = torch.tensor(az, device=device)
@@ -149,11 +155,14 @@ def get_rotation_matrix_torch(ax, ay, az, device):
                        [s[2], c[2], 0.0],
                        [0.0, 0.0, 1.0]], device=device)
 
-    # Matmul in torch
+    # Combine rotations via matrix multiplication
     return torch.matmul(rz, torch.matmul(ry, rx))
 
 def get_face_shading_torch(rotated_vertices, faces, light_dir):
-    """Vectorized shading calculation on GPU."""
+    """
+    Calculates face shading (Lambertian reflectance) using GPU-accelerated vector operations.
+    Computes normals via cross product and dots them with the light source.
+    """
     # Gather vertices for all faces at once
     # faces shape: [num_faces, 4]
     # v0, v1, v2 shape: [num_faces, 3]

@@ -20,8 +20,10 @@ import math
 import sdcard
 import uos
 import micropython
-from micropython import const
 from presto import Presto, Buzzer
+import rp2
+import _thread
+import array
 try:
     import ltr559
     HAS_LTR559 = True
@@ -38,24 +40,50 @@ micropython.alloc_emergency_exception_buf(100)
 # Initialize Hardware Watchdog (Safety - 8s timeout)
 wdt = machine.WDT(timeout=8000)
 
-# Global constants for optimization
+# -- HARDWARE SETUP & GLOBAL CONSTANTS --
+
+# Number of addressable RGB LEDs on the Presto's ambient bar
 NUM_LEDS = const(7)
-# For 18-bit LFSR (covers 512x512)
+
+# LFSR Tap for 18-bit pseudo-random sequence (used for transitions)
 TAP = const(0x20400) 
+
+# Time in seconds between automatic image transitions
 INTERVAL = const(60 * 1)
+
+# LED Index groups for directional feedback
 LEDS_LEFT = (4, 5, 6)
 LEDS_RIGHT = (0, 1, 2)
+
+# PIO WS2812/SK6812 Driver Program
+@rp2.asm_pio(sideset_init=rp2.PIO.OUT_LOW, out_shiftdir=rp2.PIO.SHIFT_LEFT, autopull=True, pull_thresh=24)
+def ws2812():
+    T1 = 2
+    T2 = 5
+    T3 = 3
+    wrap_target()
+    label("bitloop")
+    out(x, 1)               .side(0)    [T3 - 1]
+    jmp(not_x, "do_zero")   .side(1)    [T1 - 1]
+    jmp("bitloop")          .side(1)    [T2 - 1]
+    label("do_zero")
+    nop()                   .side(0)    [T2 - 1]
+    wrap()
 
 # DEBUG MODE (Set to False for pure production silence)
 DEBUG = True
 
 class Profiler:
-    """Non-intrusive machine-specific performance tracking."""
+    """
+    A lightweight performance profiler that tracks execution time of code blocks.
+    Designed for low overhead on MicroPython.
+    """
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.stats = {}
 
     def start(self, label):
+        """Record the start time (microseconds) for a given label."""
         if self.enabled:
             self.stats[label] = time.ticks_us()
 
@@ -69,12 +97,17 @@ class Profiler:
 profiler = Profiler(enabled=DEBUG)
 
 class ImageNode:
+    """A node in a circular doubly linked list representing an image file."""
     def __init__(self, filename):
         self.filename = filename
         self.next = None
         self.prev = None
 
 class Gallery:
+    """
+    Manages the collection of images on the SD card or internal flash.
+    Handles file discovery, sorting, and navigation.
+    """
     def __init__(self, display_error_callback):
         self.directory = 'gallery'
         self.current_node = None
@@ -151,6 +184,10 @@ class Gallery:
             self.current_node = self.current_node.prev
 
 class VisualEffects:
+    """
+    Implements various graphical transition effects and generative art.
+    Uses Layer 0 (background) and Layer 1 (overlay) for smooth visuals.
+    """
     def __init__(self, presto, display, jpeg):
         self.presto = presto
         self.display = display
@@ -359,6 +396,10 @@ class VisualEffects:
         self.presto.update()
 
 class PhotoFrame:
+    """
+    The main application class for the Pimoroni Presto Photo Frame.
+    Orchestrates hardware, display, transitions, and background LED effects.
+    """
     def __init__(self):
         # --- Constants and setup ---
 
@@ -414,8 +455,71 @@ class PhotoFrame:
         # Pre-calculate sine table for breathing effect 
         self.sine_table = bytearray([int((math.sin(i * 6.28318 / 256) + 1) * 20) for i in range(256)])
         
-        # Day/Night mode state
-        self.is_dark = False
+        # PIO State Machine Setup (GPIO 33, 800kHz bit rate)
+        # We use state machine 4 (PIO 1, SM 0) to avoid potential resource 
+        # conflicts with the display driver which often claims SM 0-3 on PIO 0.
+        # freq=8_000_000 ensures each PIO instruction cycle is 125ns.
+        self.sm = rp2.StateMachine(4, ws2812, freq=8_000_000, sideset_base=machine.Pin(33))
+        self.sm.active(1)
+        
+        # LED Buffer (7 LEDs * 32-bit GRB)
+        # Using array.array('I') for efficient memory layout and fast FIFO transfer.
+        self.led_data = array.array("I", [0] * NUM_LEDS)
+        
+        # Thread-safe signal for UI feedback (left/right flashes).
+        # This is checked by the LED thread running on Core 1.
+        self.led_trigger = None # 'left', 'right', or None
+        
+        # Offload LED animations to Core 1 to prevent blocking Core 0
+        # which handles the heavy JPEG decoding and screen updates.
+        _thread.start_new_thread(self._led_thread, ())
+
+    def _led_thread(self):
+        """
+        Background thread for LED orchestration.
+        Running on Core 1 allows for perfectly smooth animations even
+        during disk I/O and JPEG processing on the main core.
+        """
+        while True:
+            if self.led_trigger == 'right':
+                # User touched the right side: perform a green flash
+                self._send_leds(r=0, g=255, b=0)
+                time.sleep(0.5)
+                self.led_trigger = None
+            elif self.led_trigger == 'left':
+                # User touched the left side: perform a blue flash
+                self._send_leds(r=0, g=0, b=255)
+                time.sleep(0.5)
+                self.led_trigger = None
+            elif not self.is_dark:
+                # Room is lit: continue the ambient rainbow cycle
+                self.update_leds()
+            else:
+                # Dark mode: Turn off LEDs to avoid annoyance
+                self._send_leds(0, 0, 0)
+            
+            # Small yield to allow other background tasks (if any)
+            time.sleep(0.02)
+
+    def _send_leds(self, r=None, g=None, b=None):
+        """
+        Efficiently pushes color data to the PIO state machine.
+        
+        Args:
+            r, g, b (int): If provided, fills the whole bar with this color.
+                           If None, sends the current content of self.led_data.
+        """
+        if r is not None and g is not None and b is not None:
+            # Construct a 24-bit GRB word (standard for SK6812/WS2812)
+            # Shift left by 8 so the channel data occupies the upper 24 bits 
+            # of the 32-bit FIFO word.
+            val = ((g << 16) | (r << 8) | b) << 8
+            for i in range(NUM_LEDS):
+                self.led_data[i] = val
+        
+        # Flush the buffer to the PIO FIFO.
+        # 'sm.put' pushes the array content to the hardware FIFO.
+        self.sm.put(self.led_data) 
 
     def beep(self, frequency=None, duration=0.1):
         """Play a short beep on the Presto buzzer."""
@@ -556,9 +660,12 @@ class PhotoFrame:
         hr, hg, hb = self.hsv_to_rgb(self.led_hue, 1.0, 1.0)
         r, g, b = int(hr * intensity), int(hg * intensity), int(hb * intensity)
         
-        set_led = self.presto.set_led_rgb # Cache method
+        # Update buffer with GRB values (shifted left for MSB-first out)
+        val = ((g << 16) | (r << 8) | b) << 8
         for i in range(NUM_LEDS):
-            set_led(i, r, g, b)
+            self.led_data[i] = val
+            
+        self._send_leds()
 
     # --- Image display ---
     def show_image(self, show_next=False, show_previous=False, fast=False):
@@ -678,8 +785,7 @@ class PhotoFrame:
 
             # SCREENSAVER: If idle for X seconds, start generative art
             if not self.is_dark:
-                self.update_leds()
-                
+                # The LED thread handles the rainbow cycle automatically
                 now = time.ticks_ms()
                 if time.ticks_diff(now, last_updated) > self.SCREENSAVER_DELAY * 1000 and self.lines_drawn < 100:
                     # MACHINE OPTIMIZATION: Draw 5 items per update to minimize bus latency
@@ -709,24 +815,18 @@ class PhotoFrame:
             if self.touch.state:
                 if self.touch.x > self.WIDTH // 2:   # right side → next image
                     self.beep(None, 0.1)        # random-frequency beep
-                    for i in LEDS_RIGHT:
-                        self.presto.set_led_rgb(i, 0, 255, 0)   # green flash
+                    self.led_trigger = 'right' # Signal LED thread
                     self.show_image(show_next=True, fast=False)
                     self.presto.update()
                     last_updated = time.ticks_ms()
-                    for i in LEDS_RIGHT:
-                        self.presto.set_led_rgb(i, 0, 0, 0)
                     time.sleep(0.01)
 
                 elif self.touch.x < self.WIDTH // 2: # left side → previous image
                     self.beep(None, 0.1)         # random-frequency beep
-                    for i in LEDS_LEFT:
-                        self.presto.set_led_rgb(i, 0, 0, 255)   # blue flash
+                    self.led_trigger = 'left' # Signal LED thread
                     self.show_image(show_previous=True, fast=False)
                     self.presto.update()
                     last_updated = time.ticks_ms()
-                    for i in LEDS_LEFT:
-                        self.presto.set_led_rgb(i, 0, 0, 0)
                     time.sleep(0.01)
 
                 # Wait for touch release to avoid multiple triggers
