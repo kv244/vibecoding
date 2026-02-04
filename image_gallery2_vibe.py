@@ -88,6 +88,14 @@ def asm_f32_scale(r0, r1):
     vcvt_s32_f32(s0, s0) # Convert back to integer
     vmov(r0, s0)        # Move back to ARM register
 
+# -- RP2350 SIO INTERPOLATOR OFFSETS --
+SIO_BASE = const(0xd0000000)
+INTERP0_ACCUM0 = const(SIO_BASE + 0x80)
+INTERP0_PEEK0  = const(SIO_BASE + 0xa0)
+INTERP0_PEEK1  = const(SIO_BASE + 0xa4)
+INTERP0_CTRL0  = const(SIO_BASE + 0xac)
+INTERP0_CTRL1  = const(SIO_BASE + 0xb0)
+
 # DEBUG MODE (Set to False for pure production silence)
 DEBUG = True
 
@@ -303,13 +311,27 @@ class VisualEffects:
             self.presto.update()
             if speed > 0: time.sleep(speed)
 
+    @micropython.native
     def mosaic_transition(self, speed=0.001, block_size=40):
-        """Reveal Layer 0 by clearing Layer 1 blocks to transparent."""
+        """
+        Reveal Layer 0 by clearing Layer 1 blocks to transparent.
+        Optimized using RP2350 SIO Interpolator for coordinate mapping.
+        """
         self.display.set_layer(1)
+        grid_bits = 5 # Sufficient for 16x16 or 32x32 grids
+        
+        # Calculate grid size (power of 2 for interpolator mapping)
         cols = (self.WIDTH + block_size - 1) // block_size
         rows = (self.HEIGHT + block_size - 1) // block_size
-        indices = list(range(cols * rows))
         
+        # Configure Interpolator 0 for 2D mapping
+        # Lane 0: Mask bits 0-4 (X index)
+        # Lane 1: Shift right by 5, Mask bits 0-4 (Y index)
+        machine.mem32[INTERP0_CTRL0] = (grid_bits - 1) << 10 # MASK_MSB
+        machine.mem32[INTERP0_CTRL1] = ((grid_bits - 1) << 10) | (grid_bits << 0) # MASK_MSB | SHIFT
+        
+        indices = list(range(1 << (grid_bits * 2)))
+        random.seed(time.ticks_ms())
         for i in range(len(indices) - 1, 0, -1):
             j = random.getrandbits(10) % (i + 1)
             indices[i], indices[j] = indices[j], indices[i]
@@ -317,13 +339,25 @@ class VisualEffects:
         rect = self.display.rectangle
         self.display.set_pen(self.TRANSPARENT) 
         
+        # Localize for performance
+        mem32 = machine.mem32
+        ACCUM0 = INTERP0_ACCUM0
+        PEEK0 = INTERP0_PEEK0
+        PEEK1 = INTERP0_PEEK1
+        
         for idx, i in enumerate(indices):
-            r = i // cols
-            c = i % cols
-            rect(c * block_size, r * block_size, block_size, block_size)
-            if idx % 10 == 0:
-                self.presto.update()
-                if speed > 0: time.sleep(speed)
+            # Hardware-accelerated 2D mapping
+            mem32[ACCUM0] = i
+            c = mem32[PEEK0]
+            r = mem32[PEEK1]
+            
+            # Draw only if within display bounds
+            if c < cols and r < rows:
+                rect(c * block_size, r * block_size, block_size, block_size)
+                if idx % 12 == 0: # Batch updates for smoothness
+                    self.presto.update()
+                    if speed > 0: time.sleep(speed)
+        
         self.presto.update()
 
     def curtain_transition(self, speed=0.005):
