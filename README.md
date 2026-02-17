@@ -45,6 +45,19 @@ A series of evolutional scripts integrating Google's **Gemini AI** with live web
     - **Robust & Resilient**: Features asynchronous I/O, non-blocking camera detection, and thread-safe audio concurrency.
     - **OCR & Document Analysis**: Automatically detects and extracts text from books, papers, or screens held up to the camera.
 
+- [**Hardware-Accelerated Cryptography (RISC-V / BeagleV-Fire)**]
+beagle_crypt.c:
+
+Function: Core C and Assembly routine for RISC-V.
+
+Logic: Focuses on hardware-level cryptographic acceleration. It maps directly to the BeagleV-Fire's architecture to offload heavy computation.
+
+vibecrypt.py:
+
+Function: A high-level Python wrapper for the beagle_crypt routines.
+
+Vibe: Bridges the gap between "easy-to-code" Python and "fast-to-run" hardware-level C.
+
 ---
 
 ## 🛠️ Setup & Requirements
