@@ -53,6 +53,18 @@ vibecoding/
 - **Dependency stack:** `pyray`, `numpy`. Optional: `numba`, `torch` (with CUDA).
 
 ---
+### encrypt.cu — High-Performance ChaCha20 GPU Encryptor
+**A production-grade stream cipher implementation designed for NVIDIA GPUs, offering massive parallelism.**
+
+PTX Assembly Optimization: Uses shf.l.wrap.b32 (funnel shift) for 32-bit rotations, allowing the core Quarter Round (QR) function to execute in a single hardware cycle.
+
+Pinned Memory (DMA): Leverages cudaMallocHost to saturate PCIe bandwidth during transfers.
+
+SHA-256 KDF: CPU-side hashing of passphrases for uniform 256-bit key distribution.
+
+Compilation: ```powershell
+nvcc -allow-unsupported-compiler -ccbin "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64" encrypt.cu -o encryption.exe
+
 
 ### `basic_interpreter.py` — Toy BASIC Interpreter with Graphics
 
