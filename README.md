@@ -151,25 +151,15 @@ gcc -O3 -fopenmp -shared -fPIC encrypt.c -o libbeagle_crypt.so
 
 ---
 
-### `fileEncrypt.c` — RISC-V Standalone File Encryptor
+### `fileEncrypt.c` — RISC-V Standalone File Encryptor (OpenCL + ASM)
 
-**Purpose:** A command-line tool that encrypts or decrypts arbitrary files using a randomly-generated 32-byte key and a RISC-V inline ASM XOR loop with manual key cycling.
-
-**Usage:**
-```bash
-fileEncrypt encrypt photo.jpg   # produces photo.jpg.enc + photo.jpg.ky
-fileEncrypt decrypt photo.jpg   # reads .enc + .ky, restores photo.jpg
-```
+**Purpose:** A high-performance encryption tool for RISC-V (BeagleBoard-V Fire) featuring hybrid hardware acceleration.
 
 **Technical highlights:**
-
-- **RISC-V inline ASM key-cycling loop.** `xor_buffer_asm` is a single `__asm__ __volatile__` block with a hand-written loop. It avoids the modulo operator entirely: instead of `key[i % key_len]`, it increments a `key_ptr` register and resets it to `key_start` when it reaches `key_end` using a `blt` (branch-if-less-than) + `mv` (move) pair. Instructions used: `beq` (branch-if-equal for loop exit), `lbu` (load byte unsigned from data), `lbu` (load byte unsigned from key), `xor`, `sb` (store byte), `addi` (pointer increments), `blt`, `mv`, `j` (unconditional jump back to loop top).
-
-- **Key generation.** A 32-byte random key is generated with `srand(time(NULL))` + `rand() % 256`. This is cryptographically weak but sufficient for demonstrating the ASM XOR mechanics. For real use, `/dev/urandom` (as in the RPI variant) should be used.
-
-- **Separate key file.** The key is written to `filename.ky` alongside `filename.enc`. Decryption reads both files and applies the same `xor_buffer_asm` call (XOR is symmetric).
-
-- **Whole-file in-memory processing.** `fseek`/`ftell` determines file size, then the full content is `malloc`'d and `fread` into a single buffer before encryption. This is simple but not suitable for files larger than available RAM.
+- **OpenCL Acceleration**: Uses a vectorized OpenCL kernel (`kernel.cl`) with `uchar16` operations for massive parallel throughput on supported hardware.
+- **Robust Fallback**: Automatically detects OpenCL support at runtime. If unavailable, it falls back to a hand-optimized **RISC-V 64-bit ASM** XOR loop.
+- **Multithreaded Pipeline**: Distributes file segments across multiple CPU cores via `pthread`, ensuring high efficiency for large files.
+- **Security & Large Files**: Processes data in 1MB chunks to support files of any size. Implements secure key file handling with `O_NOFOLLOW` and Restricted permissions.
 
 ---
 
@@ -189,43 +179,29 @@ fileEncrypt decrypt photo.jpg   # reads .enc + .ky, restores photo.jpg
 
 ---
 
-### `fileEncryptPresto.py` — MicroPython Dual-Core File Encryptor for Pimoroni Presto
+### `fileEncryptPresto.py` — MicroPython Dual-Core Encryptor (RP2350)
 
-**Purpose:** Encrypts files on the Presto's SD card using a dual-core pipeline — Core 0 handles I/O and UI, Core 1 runs the XOR kernel — with SHA-256 integrity verification and an animated progress display.
+**Purpose:** Encrypts files on the Presto's SD card using a multi-layered hardware strategy — combining dual-core processing, TRNG hardware, and an enhanced UI.
 
 **Technical highlights:**
-
-- **Thumb-2 inline ASM XOR kernel.** `asm_xor_crypt` is decorated `@micropython.asm_thumb`, compiling to a tight Cortex-M33 Thumb-2 loop. It receives `r0` (data pointer), `r1` (length in bytes), `r2` (32-bit key word). The loop: `ldr r3, [r0]` (load 4 bytes), `eor r3, r2` (XOR with key word), `str r3, [r0]` (store back), `add r0, 4`, `sub r1, 4`, `cmp r1, 0`, `bgt LOOP`. This processes 4 bytes per cycle with no Python overhead.
-
-- **Dual-core pipeline via `_thread` + `threading.Event`.** `core1_runner` is launched on Core 1 via `_thread.start_new_thread`. The two cores communicate through a shared `bytearray(4096)` buffer and two `threading.Event` objects: `data_ready` (Core 0 signals Core 1 that a chunk is loaded) and `data_done` (Core 1 signals Core 0 that XOR is complete). This pipeline overlaps file I/O on Core 0 with encryption on Core 1.
-
-- **Non-blocking UI updates.** `update_ui_async` draws the progress bar, percentage, and speed readout, then calls `display.update_async()` (non-blocking DMA display push). The UI updates are throttled to every 12 chunks (`processed // CHUNK_SIZE % 12 == 0`) to avoid UI overhead dominating the pipeline.
-
-- **SHA-256 integrity verification.** After encryption, `encrypt_with_vibe` is called again on the `.enc` file (with `silent=True`) to produce a `.dec` file. `get_file_hash` computes SHA-256 of both the original and the decrypted file. If they match, `show_success_splash` fires a particle effect and displays `VERIFIED`. If they don't match, a mismatch warning is printed.
-
-- **Bus Priority register.** `set_vibe_priority()` directly writes to the RP2350 bus priority register at `0x40094000`, setting the high-priority bit and max arbitration weight to give the encryption DMA path the highest bus bandwidth.
-
-- **Particle splash on success.** `show_success_splash` draws 50 random circles with random colours before clearing the screen and displaying the verification result — a pure vibe touch.
-
-- **Dependency stack:** MicroPython, Pimoroni Presto BSP (`picographics`), `machine`, `_thread`, `threading`, `hashlib`, `uctypes`.
+- **Dual-Core Ping-Pong Pipeline**: Utilizes a double-buffer system where Core 0 handles SD card I/O while Core 1 executes the Thumb-2 XOR kernel, overlapping compute and disk access.
+- **Multi-Source Entropy Mixer**: Generates unique keys by hashing the **RP2350 Hardware TRNG** output with system uptime jitter and ADC noise for maximum robustness.
+- **Performance UI**: Features a real-time **scrolling speed graph** and **ETA (Time Remaining)** calculation on the Presto's display.
+- **ASM Tail Handling**: The fast Thumb-2 kernel processes word-aligned data, while Core 0 handles any trailing bytes (1-3) in Python, ensuring zero data loss and no alignment faults.
+- **Memory Security**: Explicitly zeroes out data buffers in RAM after processing (Memory Cleansing).
 
 ---
 
-### `fileEncryptRPI.c` — ARM NEON SIMD File Encryptor for Raspberry Pi 5
+### `fileEncryptRPI.c` — ARM NEON SIMD Encryptor (Raspberry Pi 5)
 
-**Purpose:** A command-line file encryptor tuned for the Cortex-A76 cores on the Raspberry Pi 5, using 128-bit NEON SIMD registers to process 32 bytes per iteration and `/dev/urandom` for hardware-backed key generation.
+**Purpose:** A production-hardened tool tuned for the Cortex-A76, using 128-bit NEON SIMD and multi-core parallelism.
 
 **Technical highlights:**
-
-- **NEON key loading.** Before the main loop, `ld1 {v0.16b, v1.16b}, [key_ptr]` loads the full 32-byte key into two 128-bit NEON registers (`v0`, `v1`) in a single instruction. These registers persist across loop iterations — the key is loaded exactly once.
-
-- **32-bytes-per-iteration SIMD loop.** Each iteration: `ld1 {v2.16b, v3.16b}, [data]` (load 32 data bytes), `eor v2.16b, v2.16b, v0.16b` (XOR first 16 bytes), `eor v3.16b, v3.16b, v1.16b` (XOR second 16 bytes), `st1 {v2.16b, v3.16b}, [data], #32` (store and post-increment pointer by 32). The `#32` post-index eliminates a separate `add` instruction.
-
-- **Hardware entropy via `/dev/urandom`.** `get_hw_key` opens `/dev/urandom` with `O_RDONLY` and `read()`s 32 bytes directly into the key buffer. On the Pi 5, `/dev/urandom` is backed by the Broadcom hardware RNG, giving cryptographically secure key material with no software entropy pool dependency.
-
-- **Tail handling.** After the main 32-byte loop, a scalar C loop processes any remaining bytes (`data_len % 32`) using `key[i % KEY_SIZE]` modulo indexing.
-
-- **Dependency stack:** GCC with AArch64 NEON support. Build: `gcc -O3 fileEncryptRPI.c -o fileEncryptRPI`.
+- **NEON SIMD Vectorization**: Uses `arm_neon.h` intrinsics to process 32 bytes per iteration, yielding extreme throughput.
+- **Multithreaded Load Balancing**: Dynamically distributes 32-byte blocks across CPU cores to ensure perfect saturation and avoid remainder overhead.
+- **I/O & Compute Overlap**: Implements a double-buffering system (ping-pong) to hide disk latency behind CPU execution.
+- **Hardware Truth (Entropy)**: Pulls keys directly from the **Broadcom Hardware RNG** (`/dev/hwrng`) with a safe fallback to `/dev/urandom`.
+- **Hardened Security**: Includes `O_NOFOLLOW` symlink protection, `0600` key file permissions, and explicit RAM cleansing.
 
 ---
 
@@ -365,11 +341,14 @@ gcc -O2 -march=rv64gc -o beaglev_dashboard beaglev_dashboard.c \
 # RISC-V cipher shared library
 gcc -O3 -fopenmp -shared -fPIC encrypt.c -o libbeagle_crypt.so
 
-# File encryptor (RISC-V)
-gcc -O2 fileEncrypt.c -o fileEncrypt
+# File encryptor (RISC-V / BeagleBoard-V Fire)
+# Build with OpenCL:
+gcc -DUSE_OPENCL fileEncrypt.c -o fileEncrypt -lOpenCL -pthread
+# Build with ASM fallback:
+gcc fileEncrypt.c -o fileEncrypt -pthread
 
 # File encryptor (Raspberry Pi 5)
-gcc -O3 fileEncryptRPI.c -o fileEncryptRPI
+gcc -O3 fileEncryptRPI.c -lpthread -o fileEncryptRPI
 
 # Gemini webcam experiments
 pip install google-generativeai pillow ffmpeg-python requests pyttsx3

@@ -1,14 +1,18 @@
-// Compile with: riscv64-unknown-elf-gcc -pthread fileEncrypt.c -o fileEncrypt
-
+#define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 
 #ifndef PATH_MAX
@@ -30,6 +34,7 @@ typedef struct {
 
 /**
  * RISC-V Optimized XOR Cipher (Modified for key offsets)
+ * Optimized for BeagleBoard-V Fire (RISC-V 64)
  */
 void xor_buffer_asm(unsigned char *data, size_t data_len, unsigned char *key,
                     size_t key_len, size_t key_start_idx) {
@@ -65,6 +70,85 @@ void xor_buffer_asm(unsigned char *data, size_t data_len, unsigned char *key,
       : "t0", "t1", "memory");
 }
 
+#ifdef USE_OPENCL
+#include <CL/cl.h>
+
+// OpenCL Global State
+cl_context ocl_context;
+cl_command_queue ocl_queue;
+cl_program ocl_program;
+cl_kernel ocl_kernel;
+
+int init_opencl() {
+  cl_platform_id platform;
+  cl_device_id device;
+  cl_int err;
+
+  err = clGetPlatformIDs(1, &platform, NULL);
+  if (err != CL_SUCCESS)
+    return -1;
+
+  err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &device, NULL);
+  if (err != CL_SUCCESS)
+    return -1;
+
+  ocl_context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+  ocl_queue = clCreateCommandQueue(ocl_context, device, 0, &err);
+
+  FILE *kf = fopen("kernel.cl", "r");
+  if (!kf)
+    return -1;
+  fseek(kf, 0, SEEK_END);
+  size_t ksize = ftell(kf);
+  rewind(kf);
+  char *ksrc = malloc(ksize + 1);
+  if (!ksrc) {
+    fclose(kf);
+    return -1;
+  }
+  fread(ksrc, 1, ksize, kf);
+  ksrc[ksize] = '\0';
+  fclose(kf);
+
+  ocl_program = clCreateProgramWithSource(ocl_context, 1, (const char **)&ksrc,
+                                          &ksize, &err);
+  free(ksrc);
+  err = clBuildProgram(ocl_program, 0, NULL, NULL, NULL, NULL);
+  if (err != CL_SUCCESS) {
+    char buffer[2048];
+    clGetProgramBuildInfo(ocl_program, device, CL_PROGRAM_BUILD_LOG,
+                          sizeof(buffer), buffer, NULL);
+    fprintf(stderr, "CL Build Error: %s\n", buffer);
+    return -1;
+  }
+
+  ocl_kernel = clCreateKernel(ocl_program, "xor_cipher", &err);
+  return (err == CL_SUCCESS) ? 0 : -1;
+}
+
+int run_opencl_xor(unsigned char *data, size_t len, unsigned char *key) {
+  cl_int err;
+  cl_mem d_buf = clCreateBuffer(
+      ocl_context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, len, data, &err);
+  cl_mem k_buf = clCreateBuffer(
+      ocl_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 32, key, &err);
+
+  clSetKernelArg(ocl_kernel, 0, sizeof(cl_mem), &d_buf);
+  clSetKernelArg(ocl_kernel, 1, sizeof(cl_mem), &k_buf);
+  unsigned int ksize = 32;
+  clSetKernelArg(ocl_kernel, 2, sizeof(unsigned int), &ksize);
+
+  size_t global_size = len / 16;
+  err = clEnqueueNDRangeKernel(ocl_queue, ocl_kernel, 1, NULL, &global_size,
+                               NULL, 0, NULL, NULL);
+  clEnqueueReadBuffer(ocl_queue, d_buf, CL_TRUE, 0, len, data, 0, NULL, NULL);
+
+  clReleaseMemObject(d_buf);
+  clReleaseMemObject(k_buf);
+  return (err == CL_SUCCESS) ? 0 : -1;
+}
+#endif
+
 void *worker(void *args) {
   ThreadArgs *t_args = (ThreadArgs *)args;
   t_args->success = 0;
@@ -75,16 +159,15 @@ void *worker(void *args) {
     return NULL;
   }
 
-  FILE *fout =
-      fopen(t_args->out_name, "r+b"); // Open for update to write at offset
+  FILE *fout = fopen(t_args->out_name, "r+b");
   if (!fout) {
     perror("Thread failed to open output file");
     fclose(fin);
     return NULL;
   }
 
-  unsigned char *buffer = malloc(CHUNK_SIZE);
-  if (!buffer) {
+  unsigned char *buffer = NULL;
+  if (posix_memalign((void **)&buffer, 16, CHUNK_SIZE) != 0) {
     fprintf(stderr, "Thread memory allocation failed\n");
     fclose(fin);
     fclose(fout);
@@ -103,17 +186,26 @@ void *worker(void *args) {
   while (remaining > 0) {
     size_t to_read = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : (size_t)remaining;
     size_t bytes_read = fread(buffer, 1, to_read, fin);
-    if (bytes_read == 0) {
-      if (ferror(fin))
-        perror("Read error");
+    if (bytes_read == 0)
       break;
-    }
 
     size_t key_idx = (size_t)(current_pos % KEY_SIZE);
-    xor_buffer_asm(buffer, bytes_read, t_args->key, KEY_SIZE, key_idx);
+
+    int processed = 0;
+#ifdef USE_OPENCL
+    if (bytes_read % 16 == 0) {
+      if (run_opencl_xor(buffer, bytes_read, t_args->key) == 0) {
+        processed = 1;
+      }
+    }
+#endif
+
+    if (!processed) {
+      xor_buffer_asm(buffer, bytes_read, t_args->key, KEY_SIZE, key_idx);
+    }
 
     if (fwrite(buffer, 1, bytes_read, fout) != bytes_read) {
-      perror("Write error (disk full?)");
+      perror("Write error");
       goto cleanup;
     }
 
@@ -131,7 +223,20 @@ cleanup:
   return NULL;
 }
 
+#ifdef USE_OPENCL
+int ocl_active = 0;
+#endif
+
 int main(int argc, char *argv[]) {
+#ifdef USE_OPENCL
+  if (init_opencl() == 0) {
+    ocl_active = 1;
+    printf("[INFO] OpenCL hardware acceleration ACTIVE.\n");
+  } else {
+    printf("[WARN] OpenCL failed. Using RISC-V ASM optimization.\n");
+  }
+#endif
+
   if (argc < 3) {
     printf("Usage: %s [encrypt|decrypt] [filename]\n", argv[0]);
     return 1;
@@ -158,23 +263,22 @@ int main(int argc, char *argv[]) {
   }
 
   off_t fsize = 0;
-  if (strcmp(mode, "encrypt") == 0) {
-    FILE *f = fopen(filename, "rb");
-    if (!f) {
-      perror("Source file error");
-      return 1;
-    }
-    fseeko(f, 0, SEEK_END);
-    fsize = ftello(f);
-    fclose(f);
+  struct stat st;
+  if (stat((strcmp(mode, "encrypt") == 0) ? filename : enc_name, &st) == 0) {
+    fsize = st.st_size;
+  } else {
+    perror("Stat failed");
+    return 1;
+  }
 
+  if (strcmp(mode, "encrypt") == 0) {
     srand((unsigned int)time(NULL));
     for (int i = 0; i < KEY_SIZE; i++)
       key[i] = (unsigned char)(rand() % 256);
 
     FILE *fk = fopen(key_name, "wb");
     if (!fk) {
-      perror("Key file creation error");
+      perror("Key file error");
       return 1;
     }
     fwrite(key, 1, KEY_SIZE, fk);
@@ -186,31 +290,22 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     if (fread(key, 1, KEY_SIZE, fk) != KEY_SIZE) {
-      fprintf(stderr, "Failed to read key\n");
+      fprintf(stderr, "Key read error\n");
       fclose(fk);
       return 1;
     }
     fclose(fk);
-
-    FILE *fe = fopen(enc_name, "rb");
-    if (!fe) {
-      perror("Encrypted file error");
-      return 1;
-    }
-    fseeko(fe, 0, SEEK_END);
-    fsize = ftello(fe);
-    fclose(fe);
   }
 
-  // Pre-create/truncate output file
+  // Pre-create output file
   FILE *fout = fopen(out_name, "wb");
   if (!fout) {
-    perror("Output file pre-creation error");
+    perror("Output file error");
     return 1;
   }
   if (fsize > 0) {
     if (fseeko(fout, fsize - 1, SEEK_SET) != 0 || fputc(0, fout) == EOF) {
-      perror("Failed to pre-allocate output file");
+      perror("Pre-allocation failed");
       fclose(fout);
       return 1;
     }
@@ -232,9 +327,7 @@ int main(int argc, char *argv[]) {
                          : segment_size;
 
     if (pthread_create(&threads[i], NULL, worker, &args[i]) != 0) {
-      perror("Failed to create thread");
-      // In a real app we'd cancel others, but here we just wait and check
-      // success
+      perror("Thread creation failed");
     }
   }
 
@@ -245,11 +338,26 @@ int main(int argc, char *argv[]) {
       all_success = 0;
   }
 
+#ifdef USE_OPENCL
+  if (ocl_active) {
+    clReleaseKernel(ocl_kernel);
+    clReleaseProgram(ocl_program);
+    clReleaseCommandQueue(ocl_queue);
+    clReleaseContext(ocl_context);
+  }
+#endif
+
   if (all_success) {
-    printf("Successfully %sed %s using %d threads\n", mode, filename,
-           NUM_THREADS);
+    printf("Successfully %sed %s using %d threads (%s)\n", mode, filename,
+           NUM_THREADS,
+#ifdef USE_OPENCL
+           ocl_active ? "OPENCL MODE" : "RISC-V ASM FALLBACK"
+#else
+           "RISC-V ASM MODE"
+#endif
+    );
   } else {
-    fprintf(stderr, "Operation failed in one or more threads.\n");
+    fprintf(stderr, "Operation failed.\n");
     return 1;
   }
 

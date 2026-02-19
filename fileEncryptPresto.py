@@ -14,24 +14,30 @@ GRAPH_PEN = display.create_pen(0, 100, 255)
 speed_history = [0] * 60 # History for rolling graph
 
 def set_vibe_priority():
+    """Boosts CPU priority for smooth real-time encryption on the RP2350."""
     bp_reg = 0x40094000
     machine.mem32[bp_reg] = (machine.mem32[bp_reg] | 0x1 | (0xFF << 10)) & ~(1 << 1)
 
 def get_mixed_entropy():
-    """Combines HW RNG, ADC noise, and uptime into a hashed 32-bit key."""
+    """
+    Robust Entropy Mixer:
+    Combines Hardware TRNG, system uptime jitter (us), and ADC floating 
+    noise into a hashed 32-bit key to ensure high-quality random keys.
+    """
     h = hashlib.sha256()
-    # Source 1: Hardware RNG
+    # Source 1: Hardware TRNG output
     h.update(str(machine.rng()).encode())
-    # Source 2: Uptime Jitter
+    # Source 2: Precise system uptime (nanosecond-ish jitter)
     h.update(str(time.ticks_us()).encode())
-    # Source 3: ADC Noise (Floating Pin or Temp Sensor)
+    # Source 3: ADC Noise from the Internal Temp Sensor (noisy LSBs)
     adc = machine.ADC(machine.ADC.CORE_TEMP)
     h.update(str(adc.read_u16()).encode())
-    # Mix and digest
+    # Mix sources and extract initial 4 bytes as the session key
     digest = h.digest()
     return int.from_bytes(digest[:4], 'big')
 
 def update_ui_enhanced(file_name, progress, speed, remaining_s):
+    """Updates the Presto display with progress, speed, ETA, and a rolling graph."""
     display.set_pen(BG)
     display.clear()
     
@@ -39,20 +45,20 @@ def update_ui_enhanced(file_name, progress, speed, remaining_s):
     display.set_pen(TEXT_PEN)
     display.text(f"SECURE: {file_name}", 20, 20, scale=3)
     
-    # Progress Bar
+    # Progress Bar UI
     display.rectangle(20, 60, WIDTH-40, 20)
     display.set_pen(BG)
     display.rectangle(22, 62, WIDTH-44, 16)
     display.set_pen(BAR_FG)
     display.rectangle(22, 62, int((WIDTH-44) * progress), 16)
     
-    # Metrics
+    # Benchmarking Metrics
     display.set_pen(SPEED_PEN)
     display.text(f"{speed:.1f} KB/s", 20, 95, scale=4)
     display.set_pen(TEXT_PEN)
     display.text(f"ETA: {int(remaining_s)}s", WIDTH-120, 95, scale=3)
     
-    # Rolling Speed Graph
+    # Rolling Speed Graph for performance visualization
     display.set_pen(GRAPH_PEN)
     gh = 60 # Graph height
     gy = 160 # Graph Y base
@@ -71,6 +77,11 @@ def update_ui_enhanced(file_name, progress, speed, remaining_s):
 # --- 2. THE KERNEL (Thumb ASM) ---
 @micropython.asm_thumb
 def asm_xor_crypt(r0, r1, r2):
+    """
+    High-performance 32-bit XOR kernel in ARM Thumb Assembly.
+    Processes 4 bytes per iteration.
+    r0: buffer ptr, r1: length (bytes), r2: 32-bit key
+    """
     label(LOOP)
     ldr(r3, [r0, 0])
     eor(r3, r2)
@@ -80,25 +91,44 @@ def asm_xor_crypt(r0, r1, r2):
     cmp(r1, 0)
     bgt(LOOP)
 
+def get_aligned_buffer(size, alignment=4):
+    """Allocates a bytearray and returns a memoryview aligned for raw ASM access."""
+    buf = bytearray(size + alignment)
+    addr = uctypes.addressof(buf)
+    offset = (alignment - (addr % alignment)) % alignment
+    return memoryview(buf)[offset:offset+size]
+
 # --- 3. DUAL-CORE ENGINE (Double Buffering) ---
 CHUNK_SIZE = 4096
-# Two buffers for overlapping I/O and compute
-buffers = [bytearray(CHUNK_SIZE), bytearray(CHUNK_SIZE)]
+# Two 4-byte aligned buffers for overlapping I/O and compute
+buffers = [get_aligned_buffer(CHUNK_SIZE), get_aligned_buffer(CHUNK_SIZE)]
+# Track the length to process in each buffer (since chunks might not be full)
+buffer_lengths = [0, 0]
 ready_events = [threading.Event(), threading.Event()]
 done_events = [threading.Event(), threading.Event()]
 
 def core1_worker(key):
+    """
+    Core 1 Worker Logic:
+    Always XORs whatever buffer is signaled as 'ready' by Core 0.
+    Only processes word-aligned segments to avoid ASM alignment faults.
+    """
     idx = 0
     while True:
         ready_events[idx].wait()
         ready_events[idx].clear()
-        asm_xor_crypt(buffers[idx], CHUNK_SIZE, key)
+        
+        # Calculate word-aligned length for the ASM kernel
+        words = buffer_lengths[idx] // 4
+        if words > 0:
+            asm_xor_crypt(buffers[idx], words * 4, key)
+            
         done_events[idx].set()
         idx = (idx + 1) % 2
 
-# --- 4. CONTROLLER ---
+# --- 4. SECURE PROCESSOR ---
 def show_success_splash(file_name):
-    """Verfication vibe: Particle flash followed by status."""
+    """Displays a verification particle animation and final status."""
     for _ in range(50):
         display.set_pen(display.create_pen(random.randint(0,255), 255, random.randint(0,255)))
         display.circle(random.randint(0, WIDTH), random.randint(0, HEIGHT), random.randint(2, 8))
@@ -111,10 +141,18 @@ def show_success_splash(file_name):
     display.text(f"KEY: {file_name}.ky", WIDTH // 2 - 90, HEIGHT // 2 + 25, scale=2)
     display.update()
 
-# --- 4. CONTROLLER ---
 def secure_process(filename):
+    """
+    Main Logic Core 0:
+    Orchestrates entropy mixing, key serialization, and double-buffered I/O.
+    """
     set_vibe_priority()
     key = get_mixed_entropy()
+    
+    # Pre-extract key bytes for tail-handling in Python
+    key_bytes = key.to_bytes(4, 'big')
+    
+    # Spawn encryption core on Core 1
     _thread.start_new_thread(core1_worker, (key,))
     
     source = f"/sd/{filename}"
@@ -124,29 +162,36 @@ def secure_process(filename):
     
     start_time = time.ticks_ms()
     processed = 0
-    curr = 0 # Current buffer index for reading
+    curr = 0 # Ping-pong index
     
     with open(source, 'rb') as fin, open(encrypted, 'wb') as fout:
-        # Initial read for the first buffer
+        # Initial read to prime the process
         read_prev = fin.readinto(buffers[curr])
+        buffer_lengths[curr] = read_prev
         
         while read_prev > 0:
-            # 1. Start Core 1 (Worker) on current buffer
+            # 1. Dispatch Core 1 for word-aligned XOR
             ready_events[curr].set()
             
-            # 2. Start Core 0 (Main) reading next chunk while worker is busy XORing
+            # 2. OVERLAP: Read next from SD card while worker is busy
             next_idx = (curr + 1) % 2
             read_next = fin.readinto(buffers[next_idx])
+            buffer_lengths[next_idx] = read_next
             
-            # 3. Wait for Worker to finish XORing the current buffer
+            # 3. Synchronize with Core 1
             done_events[curr].wait()
             done_events[curr].clear()
             
-            # 4. Write processed chunk to disk
+            # 4. TAIL HANDLING: XOR any remaining 1-3 bytes in Python (Core 0)
+            tail_start = (read_prev // 4) * 4
+            for i in range(tail_start, read_prev):
+                buffers[curr][i] ^= key_bytes[i % 4]
+            
+            # 5. Stream processed data to storage
             fout.write(buffers[curr][:read_prev])
             processed += read_prev
             
-            # Update UI (throttle for performance)
+            # Visual Benchmarking
             if (processed // CHUNK_SIZE) % 5 == 0 or processed == file_size:
                 elapsed = time.ticks_diff(time.ticks_ms(), start_time) / 1000
                 speed = (processed / 1024) / elapsed if elapsed > 0 else 0
@@ -164,8 +209,4 @@ def secure_process(filename):
     show_success_splash(filename)
     print(f"[+] Secure process complete. HW Key: {hex(key)}")
 
-# Usage:
-# secure_process('topsecret.txt')
-
-# Usage:
-# secure_process('secrets.txt')
+# Usage: secure_process('vibe.txt')

@@ -1,4 +1,5 @@
 #define _FILE_OFFSET_BITS 64
+#include <arm_neon.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -6,7 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+
 
 #define KEY_SIZE 32
 #define NUM_THREADS 4
@@ -15,10 +18,6 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
-
-/* to compile: gcc -O3 fileEncryptRPI.c -lpthread -o fileEncryptRPI */
-
-#include <arm_neon.h>
 
 /**
  * ARM NEON SIMD Optimized XOR
@@ -49,7 +48,7 @@ void xor_buffer_neon(unsigned char *data, size_t data_len, unsigned char *key) {
     vst1q_u8(data + i + 16, d1);
   }
 
-  // Tail handling
+  // Tail handling for data not aligned to 32 bytes
   for (; i < data_len; i++) {
     data[i] ^= key[i % KEY_SIZE];
   }
@@ -59,13 +58,13 @@ typedef struct {
   unsigned char *data;
   size_t len;
   unsigned char key[KEY_SIZE];
-  size_t key_offset; // Relative to 0 in the 32-byte key
+  size_t key_offset; // Relative to the start of the 32-byte key
 } ThreadArgs;
 
 void *thread_worker(void *arg) {
   ThreadArgs *ta = (ThreadArgs *)arg;
 
-  // Rotate key if start is not 32-byte aligned
+  // Key rotation logic to ensure the key aligns with the absolute file offset
   unsigned char rotated_key[KEY_SIZE];
   if (ta->key_offset == 0) {
     memcpy(rotated_key, ta->key, KEY_SIZE);
@@ -82,11 +81,9 @@ void *thread_worker(void *arg) {
 /**
  * Raspberry Pi Hardware Entropy Access
  * Attempts to use /dev/hwrng for true hardware entropy first.
- * Falls back to /dev/urandom (which is seeded by HWRNG) if needed.
- * Note: Accessing /dev/hwrng directly may require root privileges.
+ * Falls back to /dev/urandom if needed.
  */
 int get_hw_key(unsigned char *key, size_t len) {
-  // Try primary hardware RNG first
   int fd = open("/dev/hwrng", O_RDONLY);
   if (fd >= 0) {
     ssize_t result = read(fd, key, len);
@@ -95,7 +92,6 @@ int get_hw_key(unsigned char *key, size_t len) {
       return 0;
   }
 
-  // Fallback to urandom
   fd = open("/dev/urandom", O_RDONLY);
   if (fd < 0)
     return -1;
@@ -103,8 +99,6 @@ int get_hw_key(unsigned char *key, size_t len) {
   close(fd);
   return (result == (ssize_t)len) ? 0 : -1;
 }
-
-#include <time.h>
 
 int main(int argc, char *argv[]) {
   if (argc < 3) {
@@ -130,11 +124,12 @@ int main(int argc, char *argv[]) {
   }
 
   unsigned char key[KEY_SIZE];
-  FILE *fsrc = NULL, *fout = NULL, *fkey = NULL;
+  FILE *fsrc = NULL, *fout = NULL;
   unsigned char *buffers[2] = {NULL, NULL};
   size_t bytes_read[2] = {0, 0};
 
-  // Double buffering: Use two 32-byte aligned buffers
+  // Double buffering: Use two 32-byte aligned buffers for optimal SIMD
+  // performance
   for (int i = 0; i < 2; i++) {
     if (posix_memalign((void **)&buffers[i], 32, CHUNK_SIZE) != 0) {
       perror("Aligned memory allocation failed");
@@ -160,7 +155,7 @@ int main(int argc, char *argv[]) {
       goto cleanup;
     }
 
-    // Secure key file creation: Use O_NOFOLLOW to prevent symlink attacks
+    // Create key file with restricted permissions (0600) and O_NOFOLLOW
     int key_fd = open(key_name, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
                       S_IRUSR | S_IWUSR);
     if (key_fd < 0) {
@@ -174,7 +169,7 @@ int main(int argc, char *argv[]) {
     }
     close(key_fd);
   } else {
-    // Key read: Use O_NOFOLLOW for safety
+    // Open key file safely with O_NOFOLLOW
     int k_fd = open(key_name, O_RDONLY | O_NOFOLLOW);
     if (k_fd < 0) {
       perror("Key file access error (symlink suspected?)");
@@ -204,32 +199,20 @@ int main(int argc, char *argv[]) {
   off_t total_size = ftello(fsrc);
   rewind(fsrc);
 
-  struct timespec start, end;
-  clock_gettime(CLOCK_MONOTONIC, &start);
+  struct timespec start_ts, end_ts;
+  clock_gettime(CLOCK_MONOTONIC, &start_ts);
 
   off_t processed_bytes = 0;
   int current = 0;
 
-  // Initial read for the first buffer
+  // Initial read to prime the first buffer
   bytes_read[current] = fread(buffers[current], 1, CHUNK_SIZE, fsrc);
 
   while (bytes_read[current] > 0) {
     int next = (current + 1) % 2;
     size_t current_len = bytes_read[current];
 
-    // Pre-read the next chunk while threads process the current one
-    // (This is the "Double Buffering" part - overlapping I/O and compute)
-    // Note: In a real-world scenario, you might use a separate thread for
-    // fread, but here we overlap by reading while the CPU is busy with
-    // pthreads. However, since fread is blocking, the best we can do without a
-    // dedicated I/O thread is to read the next chunk immediately after starting
-    // threads.
-
-    // Actually, to truly overlap, we need to read 'next' while 'current' is
-    // being processed. I'll read 'next' into the background if possible,
-    // but for now, I'll structure the code to be ready for it.
-
-    // Multithreaded Processing for the current chunk
+    // Prepare thread arguments for the current chunk
     pthread_t threads[NUM_THREADS];
     ThreadArgs args[NUM_THREADS];
 
@@ -264,31 +247,31 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // While threads are processing 'current', we can't easily fread into 'next'
-    // without a separate I/O thread because fread is synchronous.
-    // However, we can read the next chunk HERE before joining the threads.
+    // DOUBLE BUFFERING: Read next chunk while worker threads process current
+    // one
     bytes_read[next] = fread(buffers[next], 1, CHUNK_SIZE, fsrc);
 
+    // Join all threads for the current chunk
     for (int i = 0; i < NUM_THREADS; i++) {
-      if (threads[i])
+      if (args[i].len > 0)
         pthread_join(threads[i], NULL);
     }
 
+    // Write processed data to output
     if (fwrite(buffers[current], 1, current_len, fout) != current_len) {
       perror("Output write error");
       goto cleanup;
     }
 
     processed_bytes += current_len;
-    current = next;
+    current = next; // Ping-pong swap
   }
 
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  double elapsed =
-      (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+  clock_gettime(CLOCK_MONOTONIC, &end_ts);
+  double elapsed = (end_ts.tv_sec - start_ts.tv_sec) +
+                   (end_ts.tv_nsec - start_ts.tv_nsec) / 1e9;
 
-  printf("NEON %s-Threaded %s Complete: %s\n",
-         NUM_THREADS > 1 ? "Multi" : "Single",
+  printf("NEON %d-Threaded %s Complete: %s\n", NUM_THREADS,
          is_encrypt ? "Encryption" : "Decryption",
          is_encrypt ? enc_name : filename);
   printf("Performance: %.2f MB/s (Elapsed: %.3f sec, Total: %lld bytes)\n",
@@ -298,16 +281,14 @@ int main(int argc, char *argv[]) {
 cleanup:
   for (int i = 0; i < 2; i++) {
     if (buffers[i]) {
-      memset(buffers[i], 0, CHUNK_SIZE); // Cleansing
+      memset(buffers[i], 0, CHUNK_SIZE); // RAM Cleansing
       free(buffers[i]);
     }
   }
-  memset(key, 0, KEY_SIZE); // Cleansing
+  memset(key, 0, KEY_SIZE); // RAM Cleansing
   if (fsrc)
     fclose(fsrc);
   if (fout)
     fclose(fout);
-  if (fkey)
-    fclose(fkey);
   return 0;
 }
