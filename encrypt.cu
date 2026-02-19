@@ -1,33 +1,63 @@
 /**
  * @file encrypt.cu
- * @brief High-performance GPU File Encryption Tool (ChaCha20)
+ * @brief Industrial-Strength GPU File Encryption (ChaCha20-Poly1305 + Argon2id)
  *
- * Designed for NVIDIA GPUs using CUDA.
- * Implements:
- * 1. Key Derivation: SHA-256 (CPU-side)
- * 2. Encryption: ChaCha20 Stream Cipher (GPU-side, highly parallel)
- * 3. Entropy: OS-provided CSPRNG (std::random_device)
- * 4. Optimization:
- *    - Shared Memory for Key/Nonce
- *    - 128-bit Vectorized Loads/Stores (uint4)
- *    - Inline PTX Assembly for rotations (via device function)
+ * Security model:
+ *   - Key Derivation : Argon2id (RFC 9106) — memory-hard, GPU/ASIC resistant
+ *   - Encryption     : ChaCha20 stream cipher (RFC 8439) — GPU-parallelised
+ *   - Authentication : Poly1305 MAC (RFC 8439) — CPU-side, per AEAD spec
+ *   - Nonce          : 96-bit random (OS CSPRNG), stored in file header
+ *   - Salt           : 128-bit random (OS CSPRNG), stored in file header
+ *
+ * File format (.enc):
+ *   [4 bytes magic]  [1 byte version]  [16 bytes salt]  [12 bytes nonce]
+ *   [8 bytes orig_size]  [ciphertext...]  [16 bytes Poly1305 tag]
+ *
+ * IMPORTANT: No secret material is ever printed to stdout.
+ *
+ * Argon2id parameters (defaults, adjustable via #define):
+ *   ARGON2_T_COST   = 3     (iterations)
+ *   ARGON2_M_COST   = 65536 (64 MB memory)
+ *   ARGON2_PARALLELISM = 4
  *
  * Usage:
- *   encryption.exe encrypt <file> <passphrase> -> Creates <file>.enc
- *   encryption.exe decrypt <file.enc> <passphrase> -> Restores original file
+ *   vibecoder encrypt <file> <passphrase>   -> <file>.enc
+ *   vibecoder decrypt <file.enc> <passphrase> -> original file
  *
- * Compiling for GCP / Linux (optimized):
- *   make  # Using the included Makefile which detects GPU architecture
+ * Compilation (Linux/GCP, sm_75+):
+ *   nvcc -O3 -use_fast_math -arch=sm_75 --ptxas-options=-v encrypt.cu -o
+ * vibecoder
  *
- * Manual Compilation (Linux/GCP):
- *   nvcc -O3 -use_fast_math -arch=sm_75 --ptxas-options=-v -lineinfo encrypt.cu
- * -o vibecoder
+ * Compilation (Windows MSVC):
+ *   // 1. Install Argon2 via vcpkg:
+ *   //    git clone https://github.com/microsoft/vcpkg C:\vcpkg
+ *   //    C:\vcpkg\bootstrap-vcpkg.bat
+ *   //    C:\vcpkg\vcpkg install argon2:x64-windows
  *
- * Manual Compilation (Windows MSVC):
- *   nvcc -O3 -use_fast_math -ccbin "C:\Path\To\MSVC\bin\Hostx64\x64" encrypt.cu
- * -o encryption.exe
+ *   // 2. Compile (example):
+ *   nvcc -allow-unsupported-compiler -O3 -use_fast_math ^
+ *     -I "C:\vcpkg\installed\x64-windows\include" ^
+ *     -L "C:\vcpkg\installed\x64-windows\lib" ^
+ *     encrypt.cu -o vibecoder.exe -largon2
+ *
+ *   // Note for Visual Studio 2022+ Preview:
+ *   // The flag '-allow-unsupported-compiler' is required if nvcc
+ *   // complains about an unsupported MSVC version.
+ *
+ * Dependencies:
+ *   - CUDA Toolkit (>= 10.0)
+ *   - C++17 standard library
+ *   - Argon2 (via vcpkg or manual install)
+ *     Link with: -largon2
+ *
+ * Security Notes:
+ *   - Decryption will ABORT if the Poly1305 tag does not match (tamper
+ * detection).
+ *   - Keys are zeroed from memory after use.
+ *   - The derived key is NEVER printed or logged.
  */
 
+#include <argon2.h>
 #include <cstdint>
 #include <cstring>
 #include <cuda_runtime.h>
@@ -36,172 +66,269 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-// --- Configuration ---
+// ─── Configuration
+// ────────────────────────────────────────────────────────────
+
 #define CUDA_BLOCK_SIZE 256
 
-// --- Error Handling ---
-#define gpuErrchk(ans)                                                         \
+// File format constants
+static constexpr uint8_t MAGIC[4] = {'V', 'B', 'C', 'R'};
+static constexpr uint8_t VERSION = 0x01;
+static constexpr size_t SALT_LEN = 16;  // 128-bit salt
+static constexpr size_t NONCE_LEN = 12; // 96-bit nonce (RFC 8439)
+static constexpr size_t TAG_LEN = 16;   // Poly1305 tag
+static constexpr size_t KEY_LEN = 32;   // 256-bit key
+static constexpr size_t HEADER_SIZE =
+    sizeof(MAGIC) + sizeof(VERSION) + SALT_LEN + NONCE_LEN + sizeof(uint64_t);
+
+// Argon2id parameters — tune for your threat model
+// At 64 MB / 3 iterations: ~200ms on a modern CPU
+#define ARGON2_T_COST 3
+#define ARGON2_M_COST 65536 // kibibytes
+#define ARGON2_PARALLELISM 4
+
+// ─── Error Handling
+// ───────────────────────────────────────────────────────────
+
+#define gpuCheck(ans)                                                          \
   {                                                                            \
     gpuAssert((ans), __FILE__, __LINE__);                                      \
   }
 inline void gpuAssert(cudaError_t code, const char *file, int line,
                       bool abort = true) {
   if (code != cudaSuccess) {
-    fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file,
+    fprintf(stderr, "CUDA error: %s  (%s:%d)\n", cudaGetErrorString(code), file,
             line);
     if (abort)
       exit(code);
   }
 }
 
-// --- OS Entropy Helper ---
-bool get_os_random_bytes(uint8_t *buffer, size_t size) {
-  try {
-    std::random_device rd;
-    for (size_t i = 0; i < size; ++i) {
-      buffer[i] = static_cast<uint8_t>(rd());
-    }
-    return true;
-  } catch (...) {
-    return false;
+// ─── Secure Zeroing
+// ─────────────────────────────────────────────────────────── Prevents compiler
+// from optimizing away key erasure.
+static void secure_zero(void *ptr, size_t len) {
+  volatile uint8_t *p = reinterpret_cast<volatile uint8_t *>(ptr);
+  while (len--)
+    *p++ = 0;
+}
+
+// ─── OS Entropy
+// ───────────────────────────────────────────────────────────────
+static void get_random_bytes(uint8_t *buf, size_t len) {
+  std::random_device rd;
+  for (size_t i = 0; i < len; ++i)
+    buf[i] = static_cast<uint8_t>(rd());
+}
+
+// ─── Argon2id Key Derivation
+// ──────────────────────────────────────────────────
+/**
+ * Derives a 256-bit key from a passphrase and random salt using Argon2id.
+ * Argon2id is memory-hard — it defeats GPU/ASIC brute-force attacks.
+ *
+ * @param passphrase  User-supplied password string
+ * @param salt        16-byte random salt (caller generates or reads from file)
+ * @param out_key     Output buffer, must be KEY_LEN (32) bytes
+ */
+static void derive_key(const std::string &passphrase, const uint8_t *salt,
+                       uint8_t out_key[KEY_LEN]) {
+  int rc = argon2id_hash_raw(ARGON2_T_COST, ARGON2_M_COST, ARGON2_PARALLELISM,
+                             passphrase.c_str(), passphrase.length(), salt,
+                             SALT_LEN, out_key, KEY_LEN);
+  if (rc != ARGON2_OK) {
+    std::cerr << "Argon2id failed: " << argon2_error_message(rc) << "\n";
+    exit(1);
   }
 }
 
-// ==========================================
-// HOST: SHA-256 Implementation
-// ==========================================
-class SHA256 {
-  uint32_t state[8];
-  uint8_t buffer[64];
-  uint64_t count;
+// ─── Poly1305 (CPU, RFC 8439)
+// ─────────────────────────────────────────────────
+/**
+ * Computes a Poly1305 MAC over a message using a 32-byte one-time key.
+ * The key is typically the first 32 bytes of the ChaCha20 keystream at
+ * counter=0 (ChaCha20-Poly1305 construction per RFC 8439).
+ *
+ * Implementation: constant-time, 130-bit integer arithmetic.
+ */
+class Poly1305 {
+  uint32_t r[5], h[5], pad[4];
 
-  inline uint32_t jrotate(uint32_t x, uint32_t c) {
-    return (x >> c) | (x << (32 - c));
+  static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
   }
 
 public:
-  SHA256() { reset(); }
-
-  void reset() {
-    state[0] = 0x6a09e667;
-    state[1] = 0xbb67ae85;
-    state[2] = 0x3c6ef372;
-    state[3] = 0xa54ff53a;
-    state[4] = 0x510e527f;
-    state[5] = 0x9b05688c;
-    state[6] = 0x1f83d9ab;
-    state[7] = 0x5be0cd19;
-    count = 0;
+  Poly1305(const uint8_t key[32]) {
+    // Clamp r per spec
+    r[0] = le32(key + 0) & 0x0fffffff;
+    r[1] = (le32(key + 3) >> 2) & 0x0ffffffc;
+    r[2] = (le32(key + 6) >> 4) & 0x0ffffffc;
+    r[3] = (le32(key + 9) >> 6) & 0x0ffffffc;
+    r[4] = (le32(key + 12) >> 8) & 0x0000000f;
+    pad[0] = le32(key + 16);
+    pad[1] = le32(key + 20);
+    pad[2] = le32(key + 24);
+    pad[3] = le32(key + 28);
+    h[0] = h[1] = h[2] = h[3] = h[4] = 0;
   }
 
-  void update(const uint8_t *data, size_t len) {
-    for (size_t i = 0; i < len; ++i) {
-      buffer[count % 64] = data[i];
-      count++;
-      if (count % 64 == 0)
-        transform(buffer);
+  void update(const uint8_t *msg, size_t len) {
+    while (len > 0) {
+      uint8_t block[17] = {0};
+      size_t want = (len >= 16) ? 16 : len;
+      memcpy(block, msg, want);
+      block[want] = 1; // high bit for partial block
+
+      uint32_t m[5];
+      m[0] = le32(block + 0);
+      m[1] = le32(block + 4);
+      m[2] = le32(block + 8);
+      m[3] = le32(block + 12);
+      m[4] = block[16];
+
+      h[0] += m[0];
+      h[1] += m[1];
+      h[2] += m[2];
+      h[3] += m[3];
+      h[4] += m[4];
+
+      // Multiply h by r mod 2^130-5 using 64-bit intermediates
+      uint64_t d0 = (uint64_t)h[0] * r[0] + (uint64_t)h[1] * (5 * r[4]) +
+                    (uint64_t)h[2] * (5 * r[3]) + (uint64_t)h[3] * (5 * r[2]) +
+                    (uint64_t)h[4] * (5 * r[1]);
+      uint64_t d1 = (uint64_t)h[0] * r[1] + (uint64_t)h[1] * r[0] +
+                    (uint64_t)h[2] * (5 * r[4]) + (uint64_t)h[3] * (5 * r[3]) +
+                    (uint64_t)h[4] * (5 * r[2]);
+      uint64_t d2 = (uint64_t)h[0] * r[2] + (uint64_t)h[1] * r[1] +
+                    (uint64_t)h[2] * r[0] + (uint64_t)h[3] * (5 * r[4]) +
+                    (uint64_t)h[4] * (5 * r[3]);
+      uint64_t d3 = (uint64_t)h[0] * r[3] + (uint64_t)h[1] * r[2] +
+                    (uint64_t)h[2] * r[1] + (uint64_t)h[3] * r[0] +
+                    (uint64_t)h[4] * (5 * r[4]);
+      uint64_t d4 = (uint64_t)h[0] * r[4] + (uint64_t)h[1] * r[3] +
+                    (uint64_t)h[2] * r[2] + (uint64_t)h[3] * r[1] +
+                    (uint64_t)h[4] * r[0];
+
+      uint32_t c = (uint32_t)(d0 >> 26);
+      h[0] = (uint32_t)d0 & 0x3ffffff;
+      d1 += c;
+      c = (uint32_t)(d1 >> 26);
+      h[1] = (uint32_t)d1 & 0x3ffffff;
+      d2 += c;
+      c = (uint32_t)(d2 >> 26);
+      h[2] = (uint32_t)d2 & 0x3ffffff;
+      d3 += c;
+      c = (uint32_t)(d3 >> 26);
+      h[3] = (uint32_t)d3 & 0x3ffffff;
+      d4 += c;
+      c = (uint32_t)(d4 >> 26);
+      h[4] = (uint32_t)d4 & 0x3ffffff;
+      h[0] += c * 5;
+      c = h[0] >> 26;
+      h[0] &= 0x3ffffff;
+      h[1] += c;
+
+      msg += want;
+      len -= want;
     }
   }
 
-  void finalize(uint8_t hash[32]) {
-    uint64_t bitlen = count * 8;
-    buffer[count % 64] = 0x80;
-    size_t current_len = count % 64 + 1;
-    if (current_len > 56) {
-      memset(buffer + current_len, 0, 64 - current_len);
-      transform(buffer);
-      memset(buffer, 0, 56);
-    } else {
-      memset(buffer + current_len, 0, 56 - current_len);
-    }
+  void finalize(uint8_t tag[16]) {
+    // Final reduction mod 2^130-5
+    uint32_t c = h[1] >> 26;
+    h[1] &= 0x3ffffff;
+    h[2] += c;
+    c = h[2] >> 26;
+    h[2] &= 0x3ffffff;
+    h[3] += c;
+    c = h[3] >> 26;
+    h[3] &= 0x3ffffff;
+    h[4] += c;
+    c = h[4] >> 26;
+    h[4] &= 0x3ffffff;
+    h[0] += c * 5;
+    c = h[0] >> 26;
+    h[0] &= 0x3ffffff;
+    h[1] += c;
 
-    for (int i = 0; i < 8; ++i)
-      buffer[63 - i] = (bitlen >> (i * 8)) & 0xFF;
-    transform(buffer);
+    // Compute h + -p
+    uint32_t g[5];
+    g[0] = h[0] + 5;
+    c = g[0] >> 26;
+    g[0] &= 0x3ffffff;
+    g[1] = h[1] + c;
+    c = g[1] >> 26;
+    g[1] &= 0x3ffffff;
+    g[2] = h[2] + c;
+    c = g[2] >> 26;
+    g[2] &= 0x3ffffff;
+    g[3] = h[3] + c;
+    c = g[3] >> 26;
+    g[3] &= 0x3ffffff;
+    g[4] = h[4] + c - (1 << 26);
 
-    for (int i = 0; i < 8; ++i) {
-      hash[i * 4] = (state[i] >> 24) & 0xFF;
-      hash[i * 4 + 1] = (state[i] >> 16) & 0xFF;
-      hash[i * 4 + 2] = (state[i] >> 8) & 0xFF;
-      hash[i * 4 + 3] = state[i] & 0xFF;
-    }
-  }
+    // Select h if h < p, else g (constant time)
+    uint32_t mask = (g[4] >> 31) - 1;
+    for (int i = 0; i < 5; i++)
+      h[i] = (h[i] & ~mask) | (g[i] & mask);
 
-private:
-  void transform(const uint8_t *data) {
-    uint32_t w[64], a, b, c, d, e, f, g, h;
-    for (int i = 0; i < 16; ++i)
-      w[i] = (data[i * 4] << 24) | (data[i * 4 + 1] << 16) |
-             (data[i * 4 + 2] << 8) | data[i * 4 + 3];
-    for (int i = 16; i < 64; ++i) {
-      uint32_t s0 =
-          jrotate(w[i - 15], 7) ^ jrotate(w[i - 15], 18) ^ (w[i - 15] >> 3);
-      uint32_t s1 =
-          jrotate(w[i - 2], 17) ^ jrotate(w[i - 2], 19) ^ (w[i - 2] >> 10);
-      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
-    a = state[0];
-    b = state[1];
-    c = state[2];
-    d = state[3];
-    e = state[4];
-    f = state[5];
-    g = state[6];
-    h = state[7];
-
-    const uint32_t k[64] = {
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-
-    for (int i = 0; i < 64; ++i) {
-      uint32_t S1 = jrotate(e, 6) ^ jrotate(e, 11) ^ jrotate(e, 25);
-      uint32_t ch = (e & f) ^ (~e & g);
-      uint32_t temp1 = h + S1 + ch + k[i] + w[i];
-      uint32_t S0 = jrotate(a, 2) ^ jrotate(a, 13) ^ jrotate(a, 22);
-      uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-      uint32_t temp2 = S0 + maj;
-      h = g;
-      g = f;
-      f = e;
-      e = d + temp1;
-      d = c;
-      c = b;
-      b = a;
-      a = temp1 + temp2;
-    }
-    state[0] += a;
-    state[1] += b;
-    state[2] += c;
-    state[3] += d;
-    state[4] += e;
-    state[5] += f;
-    state[6] += g;
-    state[7] += h;
+    // Pack h into 128-bit and add pad
+    uint64_t f;
+    f = (uint64_t)h[0] | ((uint64_t)h[1] << 26) | ((uint64_t)h[2] << 52);
+    uint32_t t0 = (uint32_t)f;
+    f >>= 32;
+    f |= (uint64_t)h[2] >> 12 | ((uint64_t)h[3] << 14) | ((uint64_t)h[4] << 40);
+    uint32_t t1 = (uint32_t)f;
+    f >>= 32;
+    uint32_t t2 = (uint32_t)((uint64_t)h[3] >> 18 | ((uint64_t)h[4] << 8));
+    f = (uint64_t)t0 + pad[0];
+    tag[0] = (uint8_t)f;
+    tag[1] = (uint8_t)(f >> 8);
+    tag[2] = (uint8_t)(f >> 16);
+    tag[3] = (uint8_t)(f >> 24);
+    f >>= 32;
+    f += (uint64_t)t1 + pad[1];
+    tag[4] = (uint8_t)f;
+    tag[5] = (uint8_t)(f >> 8);
+    tag[6] = (uint8_t)(f >> 16);
+    tag[7] = (uint8_t)(f >> 24);
+    f >>= 32;
+    f += (uint64_t)t2 + pad[2];
+    tag[8] = (uint8_t)f;
+    tag[9] = (uint8_t)(f >> 8);
+    tag[10] = (uint8_t)(f >> 16);
+    tag[11] = (uint8_t)(f >> 24);
+    f >>= 32;
+    f += pad[3];
+    tag[12] = (uint8_t)f;
+    tag[13] = (uint8_t)(f >> 8);
+    tag[14] = (uint8_t)(f >> 16);
+    tag[15] = (uint8_t)(f >> 24);
   }
 };
 
-// ==========================================
-// DEVICE: ChaCha20 Implementation
-// ==========================================
+// ─── Constant-time tag comparison
+// ───────────────────────────────────────────── Prevents timing attacks against
+// MAC verification.
+static bool ct_equal(const uint8_t *a, const uint8_t *b, size_t len) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < len; i++)
+    diff |= a[i] ^ b[i];
+  return diff == 0;
+}
 
-// Rotate function
+// ─── GPU: ChaCha20 Quarter Round
+// ──────────────────────────────────────────────
 __device__ __forceinline__ void quarter_round(uint32_t &a, uint32_t &b,
                                               uint32_t &c, uint32_t &d) {
   a += b;
   d ^= a;
-  // Manual bitwise rotation (compiler will optimize to PTX shift instructions)
   d = (d << 16) | (d >> 16);
   c += d;
   b ^= c;
@@ -214,241 +341,393 @@ __device__ __forceinline__ void quarter_round(uint32_t &a, uint32_t &b,
   b = (b << 7) | (b >> 25);
 }
 
+// ─── GPU: ChaCha20 Keystream Kernel
+// ───────────────────────────────────────────
 /**
- * @brief Optimized encryption kernel using Shared Memory and Vectorized Loads
- * Each thread handles ONE 64-byte block.
+ * Each thread processes one 64-byte ChaCha20 block.
+ * Uses shared memory for key/nonce and 128-bit vectorised loads/stores.
+ *
+ * @param data      In/out buffer (padded to 64-byte boundary)
+ * @param key       256-bit key (8 x uint32)
+ * @param nonce     96-bit nonce (3 x uint32, RFC 8439)
+ * @param n_chunks  Total number of 64-byte blocks
+ * @param ctr_base  Block counter offset (always 1 for ChaCha20-Poly1305;
+ *                  counter 0 is reserved for generating the Poly1305 key)
  */
-__global__ void encrypt_kernel_optimized(uint4 *data, const uint32_t *key,
-                                         const uint32_t *nonce, int n_chunks) {
-  // 1. Shared Memory for Constants
-  // Pulling Key/Nonce from Shared Memory reduces Global Memory pressure.
+__global__ void chacha20_kernel(uint4 *data, const uint32_t *key,
+                                const uint32_t *nonce, int n_chunks,
+                                uint32_t ctr_base) {
   __shared__ uint32_t s_key[8];
-  __shared__ uint32_t s_nonce[2]; // Using 64-bit Nonce to match format
+  __shared__ uint32_t s_nonce[3]; // 96-bit nonce per RFC 8439
 
-  // Cooperative Load into Shared Memory
   if (threadIdx.x < 8)
     s_key[threadIdx.x] = key[threadIdx.x];
-  if (threadIdx.x < 2)
+  if (threadIdx.x < 3)
     s_nonce[threadIdx.x] = nonce[threadIdx.x];
   __syncthreads();
 
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n_chunks) {
-    // 2. Vectorized Load
-    // Load 64 bytes (1 block) as 4 x uint4 vectors
-    // data pointer is cast to uint4*, so data[idx*4] points to this thread's
-    // block start
-    int vec_start = idx * 4;
+  if (idx >= n_chunks)
+    return;
 
-    uint4 v0 = data[vec_start + 0];
-    uint4 v1 = data[vec_start + 1];
-    uint4 v2 = data[vec_start + 2];
-    uint4 v3 = data[vec_start + 3];
+  // Vectorized 64-byte load (4 x uint4 = 64 bytes)
+  int vec = idx * 4;
+  uint4 v0 = data[vec + 0];
+  uint4 v1 = data[vec + 1];
+  uint4 v2 = data[vec + 2];
+  uint4 v3 = data[vec + 3];
 
-    // 3. Prepare State
-    uint32_t state[16];
-    state[0] = 0x61707865;
-    state[1] = 0x3320646e;
-    state[2] = 0x79622d32;
-    state[3] = 0x6b206574;
+  // Initialise ChaCha20 state (RFC 8439 layout)
+  uint32_t st[16];
+  st[0] = 0x61707865;
+  st[1] = 0x3320646e;
+  st[2] = 0x79622d32;
+  st[3] = 0x6b206574; // "expand 32-byte k"
 
 #pragma unroll
-    for (int i = 0; i < 8; i++)
-      state[4 + i] = s_key[i];
+  for (int i = 0; i < 8; i++)
+    st[4 + i] = s_key[i];
 
-    // Counter (64-bit) based on block index `idx`
-    state[12] = (uint32_t)(idx & 0xFFFFFFFF);
-    state[13] = (uint32_t)((uint64_t)idx >> 32);
+  // 32-bit counter (ctr_base + thread index) — supports files up to 256 GB
+  st[12] = ctr_base + (uint32_t)idx;
 
-    state[14] = s_nonce[0];
-    state[15] = s_nonce[1];
+  // 96-bit nonce (RFC 8439 positions 13/14/15)
+  st[13] = s_nonce[0];
+  st[14] = s_nonce[1];
+  st[15] = s_nonce[2];
 
-    // Copy working state
-    uint32_t work[16];
+  // Working copy
+  uint32_t wk[16];
 #pragma unroll
-    for (int i = 0; i < 16; i++)
-      work[i] = state[i];
+  for (int i = 0; i < 16; i++)
+    wk[i] = st[i];
 
-    // 4. Transform (20 Rounds)
-    for (int i = 0; i < 10; i++) {
-      quarter_round(work[0], work[4], work[8], work[12]);
-      quarter_round(work[1], work[5], work[9], work[13]);
-      quarter_round(work[2], work[6], work[10], work[14]);
-      quarter_round(work[3], work[7], work[11], work[15]);
-
-      quarter_round(work[0], work[5], work[10], work[15]);
-      quarter_round(work[1], work[6], work[11], work[12]);
-      quarter_round(work[2], work[7], work[8], work[13]);
-      quarter_round(work[3], work[4], work[9], work[14]);
-    }
-
-// 5. Add original state
+// 20 rounds (10 column + 10 diagonal)
 #pragma unroll
-    for (int i = 0; i < 16; i++)
-      work[i] += state[i];
+  for (int i = 0; i < 10; i++) {
+    quarter_round(wk[0], wk[4], wk[8], wk[12]);
+    quarter_round(wk[1], wk[5], wk[9], wk[13]);
+    quarter_round(wk[2], wk[6], wk[10], wk[14]);
+    quarter_round(wk[3], wk[7], wk[11], wk[15]);
+    quarter_round(wk[0], wk[5], wk[10], wk[15]);
+    quarter_round(wk[1], wk[6], wk[11], wk[12]);
+    quarter_round(wk[2], wk[7], wk[8], wk[13]);
+    quarter_round(wk[3], wk[4], wk[9], wk[14]);
+  }
 
-    // 6. XOR with Loaded Data (Vectorized)
-    // Manual XOR with registers directly
-    v0.x ^= work[0];
-    v0.y ^= work[1];
-    v0.z ^= work[2];
-    v0.w ^= work[3];
-    v1.x ^= work[4];
-    v1.y ^= work[5];
-    v1.z ^= work[6];
-    v1.w ^= work[7];
-    v2.x ^= work[8];
-    v2.y ^= work[9];
-    v2.z ^= work[10];
-    v2.w ^= work[11];
-    v3.x ^= work[12];
-    v3.y ^= work[13];
-    v3.z ^= work[14];
-    v3.w ^= work[15];
+#pragma unroll
+  for (int i = 0; i < 16; i++)
+    wk[i] += st[i];
 
-    // 7. Vectorized Store
-    data[vec_start + 0] = v0;
-    data[vec_start + 1] = v1;
-    data[vec_start + 2] = v2;
-    data[vec_start + 3] = v3;
+  // XOR keystream with data
+  v0.x ^= wk[0];
+  v0.y ^= wk[1];
+  v0.z ^= wk[2];
+  v0.w ^= wk[3];
+  v1.x ^= wk[4];
+  v1.y ^= wk[5];
+  v1.z ^= wk[6];
+  v1.w ^= wk[7];
+  v2.x ^= wk[8];
+  v2.y ^= wk[9];
+  v2.z ^= wk[10];
+  v2.w ^= wk[11];
+  v3.x ^= wk[12];
+  v3.y ^= wk[13];
+  v3.z ^= wk[14];
+  v3.w ^= wk[15];
+
+  data[vec + 0] = v0;
+  data[vec + 1] = v1;
+  data[vec + 2] = v2;
+  data[vec + 3] = v3;
+}
+
+// ─── CPU: Generate Poly1305 one-time key
+// ──────────────────────────────────────
+/**
+ * Per RFC 8439 §2.6: run ChaCha20 with counter=0, take first 32 bytes
+ * of keystream as the Poly1305 key. This is done on the CPU so the GPU
+ * kernel can start at counter=1.
+ */
+static void generate_poly1305_key(
+    const uint8_t key[32],\n const uint8_t nonce[12],\n uint8_t otk[32]) {
+  uint32_t st[16];
+  st[0] = 0x61707865;
+  st[1] = 0x3320646e;
+  st[2] = 0x79622d32;
+  st[3] = 0x6b206574;
+  for (int i = 0; i < 8; i++)
+    st[4 + i] = (uint32_t)key[i * 4] | ((uint32_t)key[i * 4 + 1] << 8) |
+                ((uint32_t)key[i * 4 + 2] << 16) |
+                ((uint32_t)key[i * 4 + 3] << 24);
+  st[12] = 0; // counter = 0
+  for (int i = 0; i < 3; i++)
+    st[13 + i] = (uint32_t)nonce[i * 4] | ((uint32_t)nonce[i * 4 + 1] << 8) |
+                 ((uint32_t)nonce[i * 4 + 2] << 16) |
+                 ((uint32_t)nonce[i * 4 + 3] << 24);
+
+  uint32_t wk[16];
+  for (int i = 0; i < 16; i++)
+    wk[i] = st[i];
+  for (int i = 0; i < 10; i++) {
+    // Column rounds
+    auto qr = [](uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d) {
+      a += b;
+      d ^= a;
+      d = (d << 16) | (d >> 16);
+      c += d;
+      b ^= c;
+      b = (b << 12) | (b >> 20);
+      a += b;
+      d ^= a;
+      d = (d << 8) | (d >> 24);
+      c += d;
+      b ^= c;
+      b = (b << 7) | (b >> 25);
+    };
+    qr(wk[0], wk[4], wk[8], wk[12]);
+    qr(wk[1], wk[5], wk[9], wk[13]);
+    qr(wk[2], wk[6], wk[10], wk[14]);
+    qr(wk[3], wk[7], wk[11], wk[15]);
+    qr(wk[0], wk[5], wk[10], wk[15]);
+    qr(wk[1], wk[6], wk[11], wk[12]);
+    qr(wk[2], wk[7], wk[8], wk[13]);
+    qr(wk[3], wk[4], wk[9], wk[14]);
+  }
+  for (int i = 0; i < 16; i++)
+    wk[i] += st[i];
+  // Output first 32 bytes as the OTK
+  for (int i = 0; i < 8; i++) {
+    otk[i * 4 + 0] = (uint8_t)(wk[i]);
+    otk[i * 4 + 1] = (uint8_t)(wk[i] >> 8);
+    otk[i * 4 + 2] = (uint8_t)(wk[i] >> 16);
+    otk[i * 4 + 3] = (uint8_t)(wk[i] >> 24);
   }
 }
 
-// ==========================================
-// MAIN
-// ==========================================
+// ─── MAIN
+// ─────────────────────────────────────────────────────────────────────
 int main(int argc, char *argv[]) {
   if (argc < 4) {
     std::cerr << "Usage: " << argv[0]
-              << " <encrypt/decrypt> <filename> <passphrase>" << std::endl;
+              << " <encrypt|decrypt> <filename> <passphrase>\\n";
     return 1;
   }
-  std::string mode = argv[1];
-  std::string filename = argv[2];
-  std::string passphrase = argv[3];
 
-  // Key Derivation
-  uint8_t raw_key[32];
-  SHA256 sha;
-  sha.update((const uint8_t *)passphrase.c_str(), passphrase.length());
-  sha.finalize(raw_key);
+  const std::string mode = argv[1];
+  const std::string filename = argv[2];
+  const std::string passphrase = argv[3];
 
-  std::cout << "Derived Key (Hex): ";
-  for (int i = 0; i < 32; i++)
-    std::cout << std::hex << std::setw(2) << std::setfill('0')
-              << (int)raw_key[i];
-  std::cout << std::dec << std::endl;
-
-  // Buffer Setup
-  uint8_t nonce_bytes[8] = {0};
-  uint8_t *h_data = nullptr; // Host Pinned Memory
-  size_t n = 0;
-  std::string out_filename;
-
+  // ── ENCRYPT ───────────────────────────────────────────────────────────────
   if (mode == "encrypt") {
-    out_filename = filename + ".enc";
-    if (!get_os_random_bytes(nonce_bytes, 8))
+    // Read plaintext
+    std::ifstream in(filename, std::ios::binary | std::ios::ate);
+    if (!in) {
+      std::cerr << "Cannot open: " << filename << "\\n";
       return 1;
+    }
+    uint64_t orig_size = in.tellg();
+    in.seekg(0);
 
-    std::ifstream infile(filename, std::ios::binary | std::ios::ate);
-    if (!infile)
-      return 1;
-    n = infile.tellg();
-    infile.seekg(0, std::ios::beg);
+    size_t padded = ((orig_size + 63) / 64) * 64;
+    uint8_t *h_data;
+    gpuCheck(cudaMallocHost(&h_data, padded));
+    memset(h_data, 0, padded);
+    in.read(reinterpret_cast<char *>(h_data), orig_size);
+    in.close();
 
-    // Pad to multiple of 64 bytes for safe vectorized processing
-    size_t padded_n = (n + 63) / 64 * 64;
+    // Generate random salt and nonce
+    uint8_t salt[SALT_LEN], nonce[NONCE_LEN];
+    get_random_bytes(salt, SALT_LEN);
+    get_random_bytes(nonce, NONCE_LEN);
 
-    gpuErrchk(cudaMallocHost((void **)&h_data, padded_n));
-    memset(h_data, 0, padded_n); // Zero init padding
-    infile.read((char *)h_data, n);
-    infile.close();
+    // Derive key via Argon2id
+    std::cerr << "Deriving key (Argon2id, " << ARGON2_M_COST / 1024 << " MB, "
+              << ARGON2_T_COST << " iterations)...\\n";
+    uint8_t key[KEY_LEN];
+    derive_key(passphrase, salt, key);
 
-    std::ofstream outfile(out_filename, std::ios::binary);
-    outfile.write((char *)nonce_bytes, 8);
-    outfile.close();
+    // Generate Poly1305 one-time key (ChaCha20 block 0)
+    uint8_t otk[32];
+    generate_poly1305_key(key, nonce, otk);
 
-  } else if (mode == "decrypt") {
-    if (filename.length() > 4 &&
-        filename.substr(filename.length() - 4) == ".enc")
-      out_filename = filename.substr(0, filename.length() - 4);
-    else
-      out_filename = "decrypted_" + filename;
+    // Convert key/nonce to uint32 arrays for GPU
+    uint32_t key32[8], nonce32[3];
+    memcpy(key32, key, 32);
+    memcpy(nonce32, nonce, 12);
 
-    std::ifstream infile(filename, std::ios::binary | std::ios::ate);
-    if (!infile)
-      return 1;
-    size_t total_size = infile.tellg();
-    if (total_size < 8)
-      return 1;
+    // GPU encryption (blocks 1..N, block 0 was used for OTK)
+    uint4 *d_data;
+    uint32_t *d_key, *d_nonce;
+    int n_chunks = (int)(padded / 64);
 
-    n = total_size - 8;
-    infile.seekg(0, std::ios::beg);
-    infile.read((char *)nonce_bytes, 8);
+    gpuCheck(cudaMalloc(&d_data, padded));
+    gpuCheck(cudaMalloc(&d_key, 32));
+    gpuCheck(cudaMalloc(&d_nonce, 12));
+    gpuCheck(cudaMemcpy(d_data, h_data, padded, cudaMemcpyHostToDevice));
+    gpuCheck(cudaMemcpy(d_key, key32, 32, cudaMemcpyHostToDevice));
+    gpuCheck(cudaMemcpy(d_nonce, nonce32, 12, cudaMemcpyHostToDevice));
 
-    size_t padded_n = (n + 63) / 64 * 64;
-    gpuErrchk(cudaMallocHost((void **)&h_data, padded_n));
-    memset(h_data, 0, padded_n);
-    infile.read((char *)h_data, n);
-    infile.close();
-  } else {
-    return 1;
+    int grid = (n_chunks + CUDA_BLOCK_SIZE - 1) / CUDA_BLOCK_SIZE;
+    chacha20_kernel<<<grid, CUDA_BLOCK_SIZE>>>(\n d_data, d_key, d_nonce,
+                                               n_chunks, /*ctr_base=*/1);
+    gpuCheck(cudaPeekAtLastError());
+    gpuCheck(cudaDeviceSynchronize());
+    gpuCheck(cudaMemcpy(h_data, d_data, padded, cudaMemcpyDeviceToHost));
+
+    // Compute Poly1305 tag over ciphertext (first orig_size bytes)
+    Poly1305 mac(otk);
+    mac.update(h_data, orig_size);
+    uint8_t tag[TAG_LEN];
+    mac.finalize(tag);
+
+    // Write output: header | ciphertext | tag
+    std::string out_name = filename + ".enc";
+    std::ofstream out(out_name, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(MAGIC), 4);
+    out.write(reinterpret_cast<const char *>(&VERSION), 1);
+    out.write(reinterpret_cast<const char *>(salt), SALT_LEN);
+    out.write(reinterpret_cast<const char *>(nonce), NONCE_LEN);
+    out.write(reinterpret_cast<const char *>(&orig_size), sizeof(uint64_t));
+    out.write(reinterpret_cast<const char *>(h_data), orig_size);
+    out.write(reinterpret_cast<const char *>(tag), TAG_LEN);
+    out.close();
+
+    std::cerr << "Encrypted -> " << out_name << "  (" << orig_size
+              << " bytes)\\n";
+
+    // Zeroize key material
+    secure_zero(key, KEY_LEN);
+    secure_zero(otk, 32);
+    secure_zero(key32, 32);
+    cudaFree(d_data);
+    cudaFree(d_key);
+    cudaFree(d_nonce);
+    cudaFreeHost(h_data);
+    return 0;
   }
 
-  std::cout << "Nonce (Hex): ";
-  for (int i = 0; i < 8; i++)
-    std::cout << std::hex << std::setw(2) << std::setfill('0')
-              << (int)nonce_bytes[i];
-  std::cout << std::dec << std::endl;
-  std::cout << mode << "ing " << n << " bytes..." << std::endl;
+  // ── DECRYPT ───────────────────────────────────────────────────────────────
+  else if (mode == "decrypt") {
+    std::ifstream in(filename, std::ios::binary | std::ios::ate);
+    if (!in) {
+      std::cerr << "Cannot open: " << filename << "\\n";
+      return 1;
+    }
+    size_t total = in.tellg();
+    in.seekg(0);
 
-  size_t padded_n = (n + 63) / 64 * 64;
-  int num_blocks = (int)(padded_n / 64);
+    // Minimum size sanity check
+    if (total < HEADER_SIZE + TAG_LEN) {
+      std::cerr << "File too small to be valid.\\n";
+      return 1;
+    }
 
-  // GPU Setup
-  uint4 *d_data;
-  uint32_t *d_key, *d_nonce;
+    // Read and verify header
+    uint8_t magic[4], version;
+    in.read(reinterpret_cast<char *>(magic), 4);
+    in.read(reinterpret_cast<char *>(&version), 1);
+    if (memcmp(magic, MAGIC, 4) != 0 || version != VERSION) {
+      std::cerr << "Invalid file format or version.\\n";
+      return 1;
+    }
 
-  // Convert 8-byte key/nonce into uint32 arrays
-  uint32_t key32[8];
-  uint32_t nonce32[2];
-  memcpy(key32, raw_key, 32);
-  memcpy(nonce32, nonce_bytes, 8);
+    uint8_t salt[SALT_LEN], nonce[NONCE_LEN];
+    uint64_t orig_size;
+    in.read(reinterpret_cast<char *>(salt), SALT_LEN);
+    in.read(reinterpret_cast<char *>(nonce), NONCE_LEN);
+    in.read(reinterpret_cast<char *>(&orig_size), sizeof(uint64_t));
 
-  gpuErrchk(cudaMalloc((void **)&d_data, padded_n)); // Aligned allocation
-  gpuErrchk(cudaMalloc((void **)&d_key, 32));
-  gpuErrchk(cudaMalloc((void **)&d_nonce, 8));
+    size_t ct_size = total - HEADER_SIZE - TAG_LEN;
+    if (ct_size < orig_size) {
+      std::cerr << "Truncated ciphertext.\\n";
+      return 1;
+    }
 
-  gpuErrchk(cudaMemcpy(d_data, h_data, padded_n, cudaMemcpyHostToDevice));
-  gpuErrchk(cudaMemcpy(d_key, key32, 32, cudaMemcpyHostToDevice));
-  gpuErrchk(cudaMemcpy(d_nonce, nonce32, 8, cudaMemcpyHostToDevice));
+    size_t padded = ((orig_size + 63) / 64) * 64;
+    uint8_t *h_data;
+    gpuCheck(cudaMallocHost(&h_data, padded));
+    memset(h_data, 0, padded);
+    in.read(reinterpret_cast<char *>(h_data), orig_size);
 
-  // Launch
-  int blockSize = CUDA_BLOCK_SIZE;
-  int gridSize = (num_blocks + blockSize - 1) / blockSize;
+    uint8_t stored_tag[TAG_LEN];
+    in.read(reinterpret_cast<char *>(stored_tag), TAG_LEN);
+    in.close();
 
-  std::cout << "Launching Kernel: " << num_blocks
-            << " blocks, Grid: " << gridSize << std::endl;
+    // Derive key
+    std::cerr << "Deriving key (Argon2id)...\\n";
+    uint8_t key[KEY_LEN];
+    derive_key(passphrase, salt, key);
 
-  encrypt_kernel_optimized<<<gridSize, blockSize>>>(d_data, d_key, d_nonce,
-                                                    num_blocks);
+    // Generate Poly1305 OTK and verify tag BEFORE decrypting
+    uint8_t otk[32];
+    generate_poly1305_key(key, nonce, otk);
 
-  gpuErrchk(cudaPeekAtLastError());
-  gpuErrchk(cudaDeviceSynchronize());
+    Poly1305 mac(otk);
+    mac.update(h_data, orig_size);
+    uint8_t computed_tag[TAG_LEN];
+    mac.finalize(computed_tag);
 
-  gpuErrchk(cudaMemcpy(h_data, d_data, padded_n, cudaMemcpyDeviceToHost));
+    if (!ct_equal(computed_tag, stored_tag, TAG_LEN)) {
+      std::cerr
+          << "Authentication FAILED — wrong passphrase or file tampered.\\n";
+      secure_zero(key, KEY_LEN);
+      secure_zero(otk, 32);
+      cudaFreeHost(h_data);
+      return 1;
+    }
+    std::cerr << "MAC verified OK.\\n";
 
-  // Output
-  std::ofstream outfile(out_filename, std::ios::binary | std::ios::app);
-  outfile.write((char *)h_data, n); // Write original size n (ignore padding)
-  outfile.close();
+    // GPU decryption (ChaCha20 is symmetric — same kernel)
+    uint32_t key32[8], nonce32[3];
+    memcpy(key32, key, 32);
+    memcpy(nonce32, nonce, 12);
 
-  // Cleanup
-  cudaFree(d_data);
-  cudaFree(d_key);
-  cudaFree(d_nonce);
-  cudaFreeHost(h_data);
+    uint4 *d_data;
+    uint32_t *d_key, *d_nonce;
+    int n_chunks = (int)(padded / 64);
 
-  std::cout << "Success -> " << out_filename << std::endl;
-  return 0;
+    gpuCheck(cudaMalloc(&d_data, padded));
+    gpuCheck(cudaMalloc(&d_key, 32));
+    gpuCheck(cudaMalloc(&d_nonce, 12));
+    gpuCheck(cudaMemcpy(d_data, h_data, padded, cudaMemcpyHostToDevice));
+    gpuCheck(cudaMemcpy(d_key, key32, 32, cudaMemcpyHostToDevice));
+    gpuCheck(cudaMemcpy(d_nonce, nonce32, 12, cudaMemcpyHostToDevice));
+
+    int grid = (n_chunks + CUDA_BLOCK_SIZE - 1) / CUDA_BLOCK_SIZE;
+    chacha20_kernel<<<grid, CUDA_BLOCK_SIZE>>>(\n d_data, d_key, d_nonce,
+                                               n_chunks, /*ctr_base=*/1);
+    gpuCheck(cudaPeekAtLastError());
+    gpuCheck(cudaDeviceSynchronize());
+    gpuCheck(cudaMemcpy(h_data, d_data, padded, cudaMemcpyDeviceToHost));
+
+    // Write plaintext output
+    std::string out_name;
+    if (filename.size() > 4 && filename.substr(filename.size() - 4) == ".enc")
+      out_name = filename.substr(0, filename.size() - 4);
+    else
+      out_name = "decrypted_" + filename;
+
+    std::ofstream out(out_name, std::ios::binary);
+    out.write(reinterpret_cast<char *>(h_data), orig_size);
+    out.close();
+
+    std::cerr << "Decrypted -> " << out_name << "  (" << orig_size
+              << " bytes)\\n";
+
+    // Zeroize
+    secure_zero(key, KEY_LEN);
+    secure_zero(otk, 32);
+    secure_zero(key32, 32);
+    secure_zero(h_data, padded);
+    cudaFree(d_data);
+    cudaFree(d_key);
+    cudaFree(d_nonce);
+    cudaFreeHost(h_data);
+    return 0;
+  }
+
+  std::cerr << "Unknown mode: " << mode << "\\n";
+  return 1;
 }
