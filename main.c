@@ -49,7 +49,8 @@ int main(int argc, char **argv) {
            argv[0]);
     printf("Effects:\n");
     printf("  gain <multiplier>       (e.g., gain 1.5)\n");
-    printf("  echo <delay_samples> <decay> (e.g., echo 4410 0.5)\n");
+    printf("  echo <delay_samples> <decay> (e.g., echo 4410 0.5) [One-shot "
+           "reflection]\n");
     printf("  lowpass <strength>      (e.g., lowpass 0.8)\n");
     printf("  bitcrush <bits>         (e.g., bitcrush 8)\n");
     return 1;
