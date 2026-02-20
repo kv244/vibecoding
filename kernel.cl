@@ -1,46 +1,55 @@
-__kernel void apply_effects(__global const float* input, 
-                           __global float* output, 
+__kernel void apply_effects(__global const float4* input, 
+                           __global float4* output, 
                            const int effect_type,
                            const float param1,
                            const float param2,
                            const int num_samples) 
 {
     int gid = get_global_id(0);
-    if (gid >= num_samples) return;
+    int lid = get_local_id(0);
+    int wg  = get_local_size(0);
+    __local float4 tile[256 + 2]; // Max WG size + halo
 
-    float sample = input[gid];
+    // Each work-item processes 4 samples
+    if (gid * 4 >= num_samples) return;
 
-    // Effect types: 0=Gain, 1=Echo/Delay, 2=Lowpass, 3=Bitcrush
+    float4 sample = input[gid];
+
     if (effect_type == 0) {
-        // Gain
+        // Gain (Vectorized)
         sample *= param1; 
     } 
     else if (effect_type == 1) {
         // Simple Delay (One-Shot Reflection)
-        // NOTE: True feedback echo requires serial processing or multiple passes.
-        // Reading from 'input' ensures deterministic parallel execution but
-        // lacks the 'echo-of-echo' feedback loop.
-        int delay_samples = (int)round(param1); 
-        float decay = param2;            
-        if (gid >= delay_samples) {
-            sample += input[gid - delay_samples] * decay;
+        int delay_vec = (int)round(param1) / 4; 
+        if (gid >= delay_vec) {
+            sample += input[gid - delay_vec] * param2;
         }
     }
     else if (effect_type == 2) {
-        // Simple FIR Lowpass (3-tap averaging)
-        if (gid > 0 && gid < num_samples - 1) {
-            float filtered = (input[gid-1] + input[gid] + input[gid+1]) / 3.0f;
-            sample = sample * (1.0f - param1) + filtered * param1;
+        // Local Memory Lowpass (Vectorized & Cached)
+        tile[lid + 1] = sample;
+        if (lid == 0) {
+            tile[0] = (gid > 0) ? input[gid - 1] : (float4)(0.0f);
         }
+        if (lid == wg - 1) {
+            tile[wg + 1] = ((gid + 1) * 4 < num_samples) ? input[gid + 1] : (float4)(0.0f);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Vectorized 3-tap averaging (simple approximation)
+        float4 prev = (float4)(tile[lid].w, sample.x, sample.y, sample.z);
+        float4 next = (float4)(sample.y, sample.z, sample.w, tile[lid + 2].x);
+        float4 filtered = (prev + sample + next) / 3.0f;
+        
+        sample = sample * (1.0f - param1) + filtered * param1;
     }
     else if (effect_type == 3) {
-        // Bitcrush
-        // Use round() for param1 to avoid float imprecision issues with (int) cast
-        float levels = pown(2.0f, (int)round(param1));
-        sample = round(sample * levels) / levels;
+        // Bitcrush (Simplified)
+        // param1 is now pre-computed 'levels' from host
+        sample = round(sample * param1) / param1;
     }
 
-    // Clipping: Ensure signal stays in [-1.0, 1.0] to prevent intermediate distortion
     output[gid] = clamp(sample, -1.0f, 1.0f);
 }
 

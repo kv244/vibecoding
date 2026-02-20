@@ -1,9 +1,38 @@
 #define CL_TARGET_OPENCL_VERSION 300
 #include <CL/cl.h>
+#include <malloc.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static inline void *port_aligned_alloc(size_t size, size_t alignment) {
+#ifdef _WIN32
+  return _aligned_malloc(size, alignment);
+#else
+  void *ptr = NULL;
+  if (posix_memalign(&ptr, alignment, size) != 0)
+    return NULL;
+  return ptr;
+#endif
+}
+
+static inline void port_aligned_free(void *ptr) {
+#ifdef _WIN32
+  _aligned_free(ptr);
+#else
+  free(ptr);
+#endif
+}
+
+static inline float clamp(float val, float min, float max) {
+  if (val < min)
+    return min;
+  if (val > max)
+    return max;
+  return val;
+}
 
 // Helper macro for error checking with cleanup
 #define checkErr(err, msg)                                                     \
@@ -108,7 +137,9 @@ int main(int argc, char **argv) {
     param1 = (argc > 4) ? (float)atof(argv[4]) : 0.5f;
   } else if (strcmp(argv[3], "bitcrush") == 0) {
     effect_type = 3;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 8.0f;
+    float bits = (argc > 4) ? (float)atof(argv[4]) : 8.0f;
+    // Optimization: Precompute levels on CPU
+    param1 = powf(2.0f, roundf(bits));
   } else {
     printf("Unknown effect: %s\n", argv[3]);
     return 1;
@@ -134,10 +165,8 @@ int main(int argc, char **argv) {
     ret = 1;
     goto cleanup;
   }
-
   if (header.bitsPerSample != 16) {
-    fprintf(stderr, "Only 16-bit WAV supported (%d bits found).\n",
-            header.bitsPerSample);
+    fprintf(stderr, "Only 16-bit WAV supported.\n");
     ret = 1;
     goto cleanup;
   }
@@ -157,28 +186,17 @@ int main(int argc, char **argv) {
   fclose(fp);
   fp = NULL;
 
-  h_input = malloc(sizeof(float) * numSamples);
-  h_output = malloc(sizeof(float) * numSamples);
-  if (!h_input || !h_output) {
-    perror("Failed to allocate host buffers");
-    ret = 1;
-    goto cleanup;
-  }
-
-  for (int i = 0; i < numSamples; i++)
-    h_input[i] = raw_data[i] / 32768.0f;
-
   // --- 2. OpenCL Setup ---
   cl_uint num_platforms;
   err = clGetPlatformIDs(0, NULL, &num_platforms);
   if (err != CL_SUCCESS || num_platforms == 0) {
-    fprintf(stderr, "No OpenCL platforms found.\n");
+    fprintf(stderr, "No OpenCL platforms.\n");
     ret = 1;
     goto cleanup;
   }
   cl_platform_id *platforms = malloc(sizeof(cl_platform_id) * num_platforms);
   clGetPlatformIDs(num_platforms, platforms, NULL);
-  platform = platforms[0]; // Just take the first one for now, but logged
+  platform = platforms[0];
   free(platforms);
 
   char platform_name[128];
@@ -188,7 +206,7 @@ int main(int argc, char **argv) {
 
   err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
   if (err != CL_SUCCESS) {
-    printf("GPU not found, falling back to CPU...\n");
+    printf("Falling back to CPU...\n");
     err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL);
     checkErr(err, "clGetDeviceIDs (CPU)");
   }
@@ -198,9 +216,14 @@ int main(int argc, char **argv) {
                   NULL);
   printf("Using device: %s\n", device_name);
 
+  // Check for Unified Memory (Zero-copy optimization)
+  cl_bool unified;
+  clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified),
+                  &unified, NULL);
+  printf("Unified Memory: %s\n", unified ? "Yes" : "No");
+
   context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
   checkErr(err, "clCreateContext");
-
   queue = clCreateCommandQueueWithProperties(context, device, NULL, &err);
   checkErr(err, "clCreateCommandQueueWithProperties");
 
@@ -210,7 +233,6 @@ int main(int argc, char **argv) {
     ret = 1;
     goto cleanup;
   }
-
   program =
       clCreateProgramWithSource(context, 1, (const char **)&source, NULL, &err);
   checkErr(err, "clCreateProgramWithSource");
@@ -227,47 +249,79 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  d_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                        sizeof(float) * numSamples, h_input, &err);
-  checkErr(err, "clCreateBuffer (d_in)");
-  d_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float) * numSamples,
-                         NULL, &err);
-  checkErr(err, "clCreateBuffer (d_out)");
-
   kernel = clCreateKernel(program, "apply_effects", &err);
   checkErr(err, "clCreateKernel");
 
-  err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in);
-  checkErr(err, "clSetKernelArg 0");
-  err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out);
-  checkErr(err, "clSetKernelArg 1");
-  err = clSetKernelArg(kernel, 2, sizeof(int), &effect_type);
-  checkErr(err, "clSetKernelArg 2");
-  err = clSetKernelArg(kernel, 3, sizeof(float), &param1);
-  checkErr(err, "clSetKernelArg 3");
-  err = clSetKernelArg(kernel, 4, sizeof(float), &param2);
-  checkErr(err, "clSetKernelArg 4");
-  err = clSetKernelArg(kernel, 5, sizeof(int), &numSamples);
-  checkErr(err, "clSetKernelArg 5");
+  // Optimization: Queries for optimal Work-Group size
+  size_t preferred_wg;
+  clGetKernelWorkGroupInfo(kernel, device,
+                           CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                           sizeof(preferred_wg), &preferred_wg, NULL);
 
-  size_t global_size = numSamples;
-  err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, NULL, 0,
-                               NULL, NULL);
+  // Padding: Align numSamples to local_size * 4 (for float4 vectorization)
+  int samplesPerWorkItem = 4;
+  size_t alignSize = preferred_wg * samplesPerWorkItem;
+  int paddedSamples = ((numSamples + alignSize - 1) / alignSize) * alignSize;
+
+  // Aligned allocation for zero-copy
+  h_input = port_aligned_alloc(sizeof(float) * paddedSamples, 4096);
+  h_output = port_aligned_alloc(sizeof(float) * paddedSamples, 4096);
+  if (!h_input || !h_output) {
+    perror("port_aligned_alloc failed");
+    ret = 1;
+    goto cleanup;
+  }
+
+  // Initialize with zero (padding) and copy data
+  memset(h_input, 0, sizeof(float) * paddedSamples);
+  for (int i = 0; i < numSamples; i++)
+    h_input[i] = raw_data[i] / 32768.0f;
+
+  cl_mem_flags in_flags = unified ? (CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR)
+                                  : (CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR);
+  cl_mem_flags out_flags =
+      unified ? (CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR) : CL_MEM_WRITE_ONLY;
+
+  d_in = clCreateBuffer(context, in_flags, sizeof(float) * paddedSamples,
+                        h_input, &err);
+  checkErr(err, "clCreateBuffer (d_in)");
+  d_out = clCreateBuffer(context, out_flags, sizeof(float) * paddedSamples,
+                         (unified ? h_output : NULL), &err);
+  checkErr(err, "clCreateBuffer (d_out)");
+
+  err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in);
+  err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out);
+  err |= clSetKernelArg(kernel, 2, sizeof(int), &effect_type);
+  err |= clSetKernelArg(kernel, 3, sizeof(float), &param1);
+  err |= clSetKernelArg(kernel, 4, sizeof(float), &param2);
+  err |= clSetKernelArg(kernel, 5, sizeof(int), &numSamples);
+  checkErr(err, "clSetKernelArg");
+
+  size_t global_size = paddedSamples / 4;
+  size_t local_block_size = preferred_wg;
+  err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size,
+                               &local_block_size, 0, NULL, NULL);
   checkErr(err, "clEnqueueNDRangeKernel");
 
-  err =
-      clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0, sizeof(float) * numSamples,
-                          h_output, 0, NULL, NULL);
-  checkErr(err, "clEnqueueReadBuffer");
+  if (unified) {
+    cl_int map_err;
+    void *mapped_ptr = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0,
+                                          sizeof(float) * paddedSamples, 0,
+                                          NULL, NULL, &map_err);
+    checkErr(map_err, "clEnqueueMapBuffer");
+    // h_output is updated. We must unmap it before releasing d_out later.
+    clEnqueueUnmapMemObject(queue, d_out, mapped_ptr, 0, NULL, NULL);
+  } else {
+    err = clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0,
+                              sizeof(float) * paddedSamples, h_output, 0, NULL,
+                              NULL);
+    checkErr(err, "clEnqueueReadBuffer");
+  }
 
   // --- 3. Save WAV File ---
   for (int i = 0; i < numSamples; i++) {
-    float sample = h_output[i] * 32768.0f;
-    if (sample > 32767.0f)
-      sample = 32767.0f;
-    if (sample < -32768.0f)
-      sample = -32768.0f;
-    raw_data[i] = (int16_t)sample;
+    float s = h_output[i] * 32768.0f;
+    raw_data[i] = (int16_t)clamp(s, -32768.0f, 32767.0f);
   }
 
   out_fp = fopen(argv[2], "wb");
@@ -279,7 +333,7 @@ int main(int argc, char **argv) {
     fwrite(raw_data, header.subchunk2Size, 1, out_fp);
     fclose(out_fp);
     out_fp = NULL;
-    printf("Effect '%s' applied. Output saved to %s\n", argv[3], argv[2]);
+    printf("Optimized effect '%s' applied. Saved to %s\n", argv[3], argv[2]);
   }
 
 cleanup:
@@ -288,9 +342,11 @@ cleanup:
   if (out_fp)
     fclose(out_fp);
   free(raw_data);
-  free(h_input);
-  free(h_output);
   free(source);
+  if (h_input)
+    port_aligned_free(h_input);
+  if (h_output)
+    port_aligned_free(h_output);
   if (d_in)
     clReleaseMemObject(d_in);
   if (d_out)
@@ -303,6 +359,5 @@ cleanup:
     clReleaseCommandQueue(queue);
   if (context)
     clReleaseContext(context);
-
   return ret;
 }
