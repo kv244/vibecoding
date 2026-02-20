@@ -47,3 +47,27 @@ High-security file protection with massive hardware acceleration.
 * **Industrial GPU Crypto:** `encrypt.cu` leverages CUDA for **ChaCha20-Poly1305** and **Argon2id** key derivation with streaming support for large files.
 
 ---
+## 🏗 High-Performance Crypto: OpenCL vs. CUDA
+
+The repository contains two distinct hardware-accelerated encryption paths. Comparing the BeagleV-Fire's OpenCL implementation with the desktop-class CUDA implementation reveals the architectural trade-offs between **portability** and **platform-specific depth**.
+
+### **1. Implementation Comparison**
+
+| Feature | OpenCL Implementation (`fileEncrypt.c` / `kernel.cl`) | CUDA Implementation (`encrypt.cu`) |
+| :--- | :--- | :--- |
+| **Primary Goal** | **Hardware Portability:** Designed to run across RISC-V CPUs, GPUs, and FPGA fabrics. | **Deep Optimization:** Designed for industrial-strength throughput on NVIDIA hardware. |
+| **Vectorization Strategy** | **Explicit:** Uses `uchar16` vector types and `vload16`/`vstore16` to manually saturate memory lanes. | **Implicit (SIMT):** Each thread handles a single path; optimizations focus on `__shared__` memory usage. |
+| **Abstraction Level** | **Low-Level Boilerplate:** Requires manual management of platforms, devices, contexts, and command queues. | **Integrated:** Host and device code share a single file/compiler for seamless integration. |
+| **Execution Path** | **Hybrid Fallback:** Includes a hand-optimized RISC-V 64 assembly loop if the OpenCL context fails. | **Streaming Pipelined:** Uses a pinned memory windowing system to process massive files without exceeding VRAM. |
+
+
+
+### **2. Architectural Insights**
+
+#### **The OpenCL Model (BeagleV-Fire)**
+Your OpenCL implementation demonstrates the "write once, run anywhere" philosophy. Because OpenCL must remain hardware-agnostic, the kernel in `kernel.cl` uses **explicit vectorization** to ensure that the underlying hardware (whether an FPGA fabric or a GPU) uses its full SIMD width. The host code in `fileEncrypt.c` reflects the complexity of the OpenCL API, requiring significant management to compile the kernel at runtime and dispatch it to the BeagleV's fabric.
+
+#### **The CUDA Model (NVIDIA)**
+The `encrypt.cu` implementation focuses on **computational density**. By leveraging CUDA's tight coupling with NVIDIA's hardware, it implements complex, memory-hard algorithms like **Argon2id** and **ChaCha20-Poly1305** with significantly less boilerplate than OpenCL. It uses GPU **shared memory** to cache keys and nonces, dramatically reducing global memory latency compared to the standard XOR cycling seen in the OpenCL kernel.
+
+
