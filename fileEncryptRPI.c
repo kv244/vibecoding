@@ -3,15 +3,14 @@
  * VERSION: v12.5-H (Hardened)
  *
  * COMMAND SUMMARY:
- *   Encryption:  ./vibevault enc <file/dir> --key <vault_key_path>
- *   Decryption:  ./vibevault dec <file/dir> --key <vault_key_path>
- *   Key Info:    ./vibevault --keyinfo <vault_key_path>
+ *   Encryption:  ./vibevault enc <file/dir> [--key <key_dir>] [--rescue]
+ *   Decryption:  ./vibevault dec <file/dir> [--key <key_dir>] [--rescue]
+ *   Key Info:    ./vibevault --keyinfo <key_dir>
  *   Check File:  ./vibevault --check <file>
- *   Rescue Mode: ./vibevault enc/dec <file/dir> --rescue
- *                (Uses null salt if vault.ky is missing. Required for data
- * recovery.)
+ *   Rescue Mode: Append --rescue to enc/dec commands.
+ *                (Uses static emergency salt. Required for data recovery.)
  *
- * COMPILE: gcc -O3 -mcpu=native -pthread vibevault.c -o vibevault -lcrypto
+ * COMPILE: gcc -O3 -mcpu=native -pthread encrypt2.c -o vibevault -lcrypto
  */
 
 #define VERSION "v12.5-H"
@@ -25,6 +24,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
+#include <openssl/sha.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -36,41 +36,45 @@
 #include <sys/syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <termios.h>
+#include <libgen.h>
 
 // --- CONSTANTS ---
 #define MAGIC_BYTE_0 0x41
 #define MAGIC_BYTE_1 0x42
 #define MAGIC_BYTE_2 0x49
 #define MAGIC_BYTE_3 0x56
-#define KEY_SIZE 16
+#define KEY_SIZE 32
 #define HMAC_SIZE 32
 #define SALT_SIZE 16
 #define ITERATIONS 600000
-#define HEADER_SIZE 48
+#define NAME_SIZE 256
+#define HEADER_SIZE (48 + NAME_SIZE)
+#define CHUNK_SIZE (16 * 1024 * 1024)
 
-// --- SECURITY HELPERS ---
-#ifdef __linux__
-#include <sys/mman.h>
-#define SECURE_ZERO(p, l) explicit_bzero(p, l)
 #define SECURE_LOCK(p, l) mlock(p, l)
-#else
-#define SECURE_ZERO(p, l) memset(p, 0, l)
-#define SECURE_LOCK(p, l)
-#endif
+#define SECURE_ZERO(p, l) explicit_bzero(p, l)
 
 // --- RANDOMNESS ---
 int get_random_bytes(uint8_t *buf, size_t len) {
-  int fd = open("/dev/hwrng", O_RDONLY);
-  if (fd < 0) {
-    fd = open("/dev/urandom", O_RDONLY);
-  }
+  int fd = open("/dev/urandom", O_RDONLY);
   if (fd < 0) {
     perror("[!] Critical: Failed to access entropy source");
     return -1;
   }
-  ssize_t r = read(fd, buf, len);
+  size_t total = 0;
+  while (total < len) {
+    ssize_t r = read(fd, buf + total, len - total);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      close(fd);
+      return -1;
+    }
+    if (r == 0) break;
+    total += r;
+  }
   close(fd);
-  return (r == (ssize_t)len) ? 0 : -1;
+  return (total == len) ? 0 : -1;
 }
 
 // --- STRUCTURES ---
@@ -88,7 +92,7 @@ typedef struct {
 typedef struct {
   uint8_t aes_raw[KEY_SIZE];
   uint8_t hmac_raw[HMAC_SIZE];
-  uint8x16_t rkeys[11];
+  uint8x16_t rkeys[15];
 } KeySet;
 
 typedef struct {
@@ -113,6 +117,26 @@ typedef struct {
 // --- GLOBALS (DEFINED FIRST) ---
 GlobalStats stats = {.lock = PTHREAD_MUTEX_INITIALIZER};
 ThreadPool pool;
+
+void read_passphrase(const char *prompt, char *buf, size_t size) {
+  struct termios old_t, new_t;
+  printf("%s", prompt);
+  fflush(stdout);
+  if (tcgetattr(STDIN_FILENO, &old_t) != 0) {
+    perror("tcgetattr");
+    exit(1);
+  }
+  new_t = old_t;
+  new_t.c_lflag &= ~ECHO;
+  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &new_t) != 0) {
+    perror("tcsetattr");
+    exit(1);
+  }
+  if (fgets(buf, size, stdin) == NULL) buf[0] = '\0';
+  buf[strcspn(buf, "\n")] = 0;
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_t);
+  printf("\n");
+}
 
 void print_progress() {
   pthread_mutex_lock(&stats.lock);
@@ -190,34 +214,37 @@ static const uint8_t sbox[256] = {
 
 // --- CRYPTO KERNELS ---
 
-void expand_key_aes128(const uint8_t *key, uint8x16_t *rkeys) {
-  uint32_t temp[44];
-  for (int i = 0; i < 4; i++)
-    temp[i] = ((uint32_t *)key)[i];
+void expand_key_aes256(const uint8_t *key, uint8x16_t *rkeys) {
+  uint32_t temp[60];
+  for (int i = 0; i < 8; i++)
+    memcpy(&temp[i], key + (i * 4), 4); // Fix: Safe unaligned access
   uint32_t rcon = 0x01000000;
-  for (int i = 4; i < 44; i++) {
+  for (int i = 8; i < 60; i++) {
     uint32_t t = temp[i - 1];
-    if (i % 4 == 0) {
+    if (i % 8 == 0) {
       t = (sbox[(t >> 16) & 0xff] << 24) | (sbox[(t >> 8) & 0xff] << 16) |
           (sbox[t & 0xff] << 8) | sbox[t >> 24];
       t ^= rcon;
       rcon = (rcon << 1) ^ (rcon & 0x80000000 ? 0x1b : 0);
+    } else if (i % 8 == 4) {
+      t = (sbox[(t >> 24) & 0xff] << 24) | (sbox[(t >> 16) & 0xff] << 16) |
+          (sbox[(t >> 8) & 0xff] << 8) | sbox[t & 0xff];
     }
-    temp[i] = temp[i - 4] ^ t;
+    temp[i] = temp[i - 8] ^ t;
   }
-  for (int i = 0; i < 11; i++)
+  for (int i = 0; i < 15; i++)
     rkeys[i] = vld1q_u8((uint8_t *)&temp[i * 4]);
 }
 
 static inline uint8x16_t aes_encrypt_block(uint8x16_t b, uint8x16_t *k) {
   b = veorq_u8(b, k[0]); // Round 0: Initial AddRoundKey
-  for (int i = 1; i < 10; i++) {
+  for (int i = 1; i < 14; i++) {
     b = vaeseq_u8(b, vdupq_n_u8(0));
     b = vaesmcq_u8(b);
     b = veorq_u8(b, k[i]);
   }
   b = vaeseq_u8(b, vdupq_n_u8(0));
-  return veorq_u8(b, k[10]);
+  return veorq_u8(b, k[14]);
 }
 
 // 4-Way Interleaved AES-CTR ASM Kernel
@@ -240,8 +267,8 @@ static inline void aes_ctr_4way_asm(uint8_t *data, const uint8x16_t *rk,
   c2 = veorq_u8(c2, rk[0]);
   c3 = veorq_u8(c3, rk[0]);
 
-  // Rounds 1-9 (Interleaved AESE + AESMC)
-  for (int i = 1; i < 10; i++) {
+  // Rounds 1-13 (Interleaved AESE + AESMC)
+  for (int i = 1; i < 14; i++) {
     r = rk[i];
     c0 = vaeseq_u8(c0, vdupq_n_u8(0));
     c0 = vaesmcq_u8(c0);
@@ -257,8 +284,8 @@ static inline void aes_ctr_4way_asm(uint8_t *data, const uint8x16_t *rk,
     c3 = veorq_u8(c3, r);
   }
 
-  // Round 10 (Last Round)
-  r = rk[10];
+  // Round 14 (Last Round)
+  r = rk[14];
   c0 = vaeseq_u8(c0, vdupq_n_u8(0));
   c0 = veorq_u8(c0, r);
   c1 = vaeseq_u8(c1, vdupq_n_u8(0));
@@ -308,7 +335,7 @@ void *worker_loop(void *arg) {
       }
     }
     for (; i + 16 <= t->len; i += 16) {
-      uint64_t ctr[2] = {0, t->block_offset + (i / 16)};
+      uint64_t ctr[2] = {0, __builtin_bswap64(t->block_offset + (i / 16))};
       memcpy(ctr, t->nonce, 8);
       vst1q_u8(t->data + i, veorq_u8(vld1q_u8(t->data + i),
                                      aes_encrypt_block(vld1q_u8((uint8_t *)ctr),
@@ -316,7 +343,7 @@ void *worker_loop(void *arg) {
       local_done += 16;
     }
     if (i < t->len) {
-      uint64_t ctr[2] = {0, t->block_offset + (i / 16)};
+      uint64_t ctr[2] = {0, __builtin_bswap64(t->block_offset + (i / 16))};
       memcpy(ctr, t->nonce, 8);
       uint8_t tmp[16];
       vst1q_u8(tmp, aes_encrypt_block(vld1q_u8((uint8_t *)ctr), t->round_keys));
@@ -373,10 +400,39 @@ void pool_shutdown() {
   free(pool.current_tasks);
 }
 
-void dispatch_work(uint8_t *buf, size_t size, uint8x16_t *rkeys,
-                   uint8_t *nonce) {
+void dispatch_work(uint8_t *buf, size_t size, uint8x16_t *rkeys, uint8_t *nonce,
+                   uint64_t base_offset) {
   if (size == 0)
     return;
+
+  // Optimization: Process small chunks (headers, small files) synchronously
+  // to avoid thread pool overhead. Threshold: 64KB.
+  if (size < 65536) {
+    size_t i = 0;
+    for (; i + 64 <= size; i += 64) {
+      aes_ctr_4way_asm(buf + i, rkeys, nonce, base_offset + (i / 16));
+    }
+    for (; i + 16 <= size; i += 16) {
+      uint64_t ctr[2] = {0, __builtin_bswap64(base_offset + (i / 16))};
+      memcpy(ctr, nonce, 8);
+      vst1q_u8(buf + i, veorq_u8(vld1q_u8(buf + i),
+                                 aes_encrypt_block(vld1q_u8((uint8_t *)ctr), rkeys)));
+    }
+    if (i < size) {
+      uint64_t ctr[2] = {0, __builtin_bswap64(base_offset + (i / 16))};
+      memcpy(ctr, nonce, 8);
+      uint8_t tmp[16];
+      vst1q_u8(tmp, aes_encrypt_block(vld1q_u8((uint8_t *)ctr), rkeys));
+      for (size_t j = 0; i + j < size; j++)
+        buf[i + j] ^= tmp[j];
+    }
+    pthread_mutex_lock(&stats.lock);
+    stats.processed_bytes += size;
+    pthread_mutex_unlock(&stats.lock);
+    print_progress();
+    return;
+  }
+
   size_t part = (size / 16 / pool.num_workers) * 16;
   if (part == 0)
     part = size; // Single worker for small data
@@ -401,7 +457,7 @@ void dispatch_work(uint8_t *buf, size_t size, uint8x16_t *rkeys,
     tasks[i].len = (i == active - 1) ? (size - (i * part)) : part;
     tasks[i].round_keys = rkeys;
     memcpy(tasks[i].nonce, nonce, 8);
-    tasks[i].block_offset = (i * part) / 16;
+    tasks[i].block_offset = base_offset + (i * part) / 16;
     pool.current_tasks[i] = &tasks[i];
   }
   pthread_cond_broadcast(&pool.cond);
@@ -414,185 +470,234 @@ void dispatch_work(uint8_t *buf, size_t size, uint8x16_t *rkeys,
 // --- FILE OPERATIONS ---
 
 void process_file_atomic(const char *path, KeySet *ks, int encrypt) {
-  if (strstr(path, "vault.ky") || strstr(path, ".tmp") || strstr(path, ".old"))
-    return;
-  struct stat st;
-  if (lstat(path, &st) != 0 || S_ISLNK(st.st_mode))
-    return; // Safety: Reject symlinks to prevent hijacking
+  char path_copy[4096];
+  uint8_t *buffer = NULL;
+  HMAC_CTX *hctx = NULL;
+  int src_fd = -1;
+  int dst_fd = -1;
+  char tmp_path[4096] = {0};
+  char final_path[4096] = {0};
 
-  // Proactive Permission Check
-  if (access(path, R_OK) != 0) {
-    fprintf(stderr, "[!] Permission Denied (Read): %s\n", path);
-    syslog(LOG_ERR,
-           "{\"event\": \"permission_denied\", \"type\": \"read\", \"path\": "
-           "\"%s\"}",
-           path);
-    pthread_mutex_lock(&stats.lock);
-    stats.failed_files++;
-    pthread_mutex_unlock(&stats.lock);
-    return;
-  }
+  strncpy(path_copy, path, 4095);
+  char *bname = basename(path_copy);
 
-  int src_fd = open(path, O_RDONLY);
+  // Strict filtering: Only skip exact matches or specific suffixes
+  if (strcmp(bname, "vault.ky") == 0)
+    return;
+  size_t path_len = strlen(path);
+  if (path_len > 4 && (strcmp(path + path_len - 4, ".tmp") == 0 || strcmp(path + path_len - 4, ".old") == 0))
+    return;
+
+  // Fix: TOCTOU & Symlink Attack Prevention
+  // Open with O_NOFOLLOW first, then check the file descriptor
+  src_fd = open(path, O_RDONLY | O_NOFOLLOW);
   if (src_fd < 0) {
-    perror("[!] Failed to open source file");
-    pthread_mutex_lock(&stats.lock);
-    stats.failed_files++;
-    pthread_mutex_unlock(&stats.lock);
+    if (errno != ELOOP) { // ELOOP = It was a symlink
+        perror("[!] Failed to open source file");
+        pthread_mutex_lock(&stats.lock);
+        stats.failed_files++;
+        pthread_mutex_unlock(&stats.lock);
+    }
     return;
   }
-  if (fstat(src_fd, &st) != 0 || st.st_size == 0) {
-    if (st.st_size == 0)
-      fprintf(stderr, "[!] Skipping empty file: %s\n", path);
-    else
-      perror("[!] fstat failed");
+
+  struct stat st;
+  if (fstat(src_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) {
     close(src_fd);
     return;
   }
 
-  char tmp_path[4096];
   snprintf(tmp_path, 4096, "%s.tmp", path);
-  int dst_fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  // Fix: Use O_EXCL to prevent symlink hijacking (CWE-362)
+  // If the file exists, fail securely rather than overwriting.
+  dst_fd = open(tmp_path, O_RDWR | O_CREAT | O_EXCL, 0600);
   if (dst_fd < 0) {
+    if (errno == EEXIST) {
+        fprintf(stderr, "[!] Security: Temp file exists, skipping: %s\n", tmp_path);
+    }
     close(src_fd);
     return;
   }
-  size_t out_size =
-      encrypt ? (st.st_size + HEADER_SIZE) : (st.st_size - HEADER_SIZE);
-
-  if (ftruncate(dst_fd, out_size) != 0) {
-    perror("[!] ftruncate failed");
-    pthread_mutex_lock(&stats.lock);
-    stats.failed_files++;
-    pthread_mutex_unlock(&stats.lock);
-    close(src_fd);
-    close(dst_fd);
-    unlink(tmp_path);
-    return;
+  
+  // Safety: Prevent underflow on corrupt files
+  if (!encrypt && st.st_size < HEADER_SIZE) {
+      close(src_fd); close(dst_fd); unlink(tmp_path); return;
   }
 
-  void *src_map = mmap(NULL, st.st_size, PROT_READ | (encrypt ? 0 : PROT_WRITE),
-                       MAP_PRIVATE, src_fd, 0);
-  void *dst_map =
-      mmap(NULL, out_size, PROT_READ | PROT_WRITE, MAP_SHARED, dst_fd, 0);
-
-  if (src_map == MAP_FAILED || dst_map == MAP_FAILED) {
-    perror("[!] mmap failed (Large file or OOM?)");
-    pthread_mutex_lock(&stats.lock);
-    stats.failed_files++;
-    pthread_mutex_unlock(&stats.lock);
-    if (src_map != MAP_FAILED)
-      munmap(src_map, st.st_size);
-    if (dst_map != MAP_FAILED)
-      munmap(dst_map, out_size);
-    close(src_fd);
-    close(dst_fd);
-    unlink(tmp_path);
-    return;
+  buffer = malloc(CHUNK_SIZE);
+  if (!buffer) {
+    perror("[!] Memory allocation failed");
+    close(src_fd); close(dst_fd); unlink(tmp_path); return;
   }
 
-  uint8_t nonce[8], tag[HMAC_SIZE];
-  uint8_t *s = (uint8_t *)src_map;
-  uint8_t *d = (uint8_t *)dst_map;
+  hctx = HMAC_CTX_new();
+  if (!hctx) {
+    perror("[!] HMAC context failed");
+    free(buffer); close(src_fd); close(dst_fd); unlink(tmp_path); return;
+  }
+  HMAC_Init_ex(hctx, ks->hmac_raw, HMAC_SIZE, EVP_sha256(), NULL);
+
+  uint8_t nonce[8];
+  char name_buf[NAME_SIZE];
+  char dir_buf[4096];
 
   if (encrypt) {
-    if (s[0] == MAGIC_BYTE_0 && s[1] == MAGIC_BYTE_1 && s[2] == MAGIC_BYTE_2 &&
-        s[3] == MAGIC_BYTE_3) {
-      pthread_mutex_lock(&stats.lock);
-      stats.skipped_files++;
-      pthread_mutex_unlock(&stats.lock);
-      munmap(src_map, st.st_size);
-      munmap(dst_map, out_size);
-      close(src_fd);
-      close(dst_fd);
-      unlink(tmp_path);
-      return;
-    }
     if (get_random_bytes(nonce, 8) != 0) {
       fprintf(stderr, "[!] Entropy failure\n");
-      pthread_mutex_lock(&stats.lock);
-      stats.failed_files++;
-      pthread_mutex_unlock(&stats.lock);
-      munmap(src_map, st.st_size);
-      munmap(dst_map, out_size);
-      close(src_fd);
-      close(dst_fd);
-      unlink(tmp_path);
-      return;
+      goto fail;
     }
-    memcpy(d + HEADER_SIZE, s, st.st_size);
-    dispatch_work(d + HEADER_SIZE, st.st_size, ks->rkeys, nonce);
-    d[0] = MAGIC_BYTE_0;
-    d[1] = MAGIC_BYTE_1;
-    d[2] = MAGIC_BYTE_2;
-    d[3] = MAGIC_BYTE_3;
+
+    // Prepare Header
+    uint8_t header[HEADER_SIZE];
+    memset(header, 0, HEADER_SIZE);
+    header[0] = MAGIC_BYTE_0; header[1] = MAGIC_BYTE_1;
+    header[2] = MAGIC_BYTE_2; header[3] = MAGIC_BYTE_3;
     uint16_t v = 1, a = 1;
-    memcpy(d + 4, &v, 2);
-    memcpy(d + 6, &a, 2);
-    memcpy(d + 8, nonce, 8);
-    // Secure HMAC: Zero the field before calculation
-    memset(d + 16, 0, HMAC_SIZE);
-    HMAC(EVP_sha256(), ks->hmac_raw, HMAC_SIZE, d + 8, out_size - 8, tag, NULL);
-    memcpy(d + 16, tag, HMAC_SIZE);
-  } else {
-    if (!(s[0] == MAGIC_BYTE_0 && s[1] == MAGIC_BYTE_1 &&
-          s[2] == MAGIC_BYTE_2 && s[3] == MAGIC_BYTE_3)) {
-      syslog(LOG_NOTICE,
-             "{\"event\": \"decryption_rejected\", \"path\": \"%s\"}", path);
+    memcpy(header + 4, &v, 2);
+    memcpy(header + 6, &a, 2);
+    memcpy(header + 8, nonce, 8);
+    // Tag at +16 is already 0 from memset
+
+    // Encrypt Filename
+    const char *base_name = strrchr(path, '/');
+    base_name = base_name ? base_name + 1 : path;
+    strncpy((char *)(header + 48), base_name, NAME_SIZE - 1);
+    // Encrypt filename part (offset 48, len 256) with block offset 0
+    dispatch_work(header + 48, NAME_SIZE, ks->rkeys, nonce, 0);
+
+    // Write Header
+    if (write(dst_fd, header, HEADER_SIZE) != HEADER_SIZE) goto fail;
+
+    // HMAC Update Header (Tag field is 0)
+    HMAC_Update(hctx, header, HEADER_SIZE);
+
+    // Process Body
+    ssize_t r;
+    uint64_t ctr = NAME_SIZE / 16; // Start after filename blocks
+    while ((r = read(src_fd, buffer, CHUNK_SIZE)) > 0) {
+      dispatch_work(buffer, r, ks->rkeys, nonce, ctr);
+      ctr += (r + 15) / 16;
+      HMAC_Update(hctx, buffer, r);
+      if (write(dst_fd, buffer, r) != r) goto fail;
+    }
+
+    // Finalize HMAC and write tag
+    uint8_t tag[HMAC_SIZE];
+    HMAC_Final(hctx, tag, NULL);
+    if (pwrite(dst_fd, tag, HMAC_SIZE, 16) != HMAC_SIZE) goto fail;
+
+  } else { // Decrypt
+    uint8_t header[HEADER_SIZE];
+    if (read(src_fd, header, HEADER_SIZE) != HEADER_SIZE) goto fail;
+
+    if (!(header[0] == MAGIC_BYTE_0 && header[1] == MAGIC_BYTE_1 &&
+          header[2] == MAGIC_BYTE_2 && header[3] == MAGIC_BYTE_3)) {
+      syslog(LOG_NOTICE, "{\"event\": \"decryption_rejected\", \"path\": \"%s\"}", path);
       pthread_mutex_lock(&stats.lock);
       stats.rejected_files++;
       pthread_mutex_unlock(&stats.lock);
-      munmap(src_map, st.st_size);
-      munmap(dst_map, out_size);
-      close(src_fd);
-      close(dst_fd);
-      unlink(tmp_path);
-      return;
+      goto cleanup_no_fail_count;
     }
-    memcpy(nonce, s + 8, 8);
-    uint8_t calc_tag[HMAC_SIZE];
-    uint8_t stored_tag[HMAC_SIZE];
-    memcpy(stored_tag, s + 16, HMAC_SIZE);
 
-    // Secure HMAC: Zero the field in the private map before validation
-    memset(s + 16, 0, HMAC_SIZE);
-    HMAC(EVP_sha256(), ks->hmac_raw, HMAC_SIZE, s + 8, st.st_size - 8, calc_tag,
-         NULL);
-    // Secure HMAC: Constant-time verification
+    memcpy(nonce, header + 8, 8);
+    uint8_t stored_tag[HMAC_SIZE];
+    memcpy(stored_tag, header + 16, HMAC_SIZE);
+
+    // Verify HMAC (Pass 1)
+    uint8_t header_copy[HEADER_SIZE];
+    memcpy(header_copy, header, HEADER_SIZE);
+    memset(header_copy + 16, 0, HMAC_SIZE);
+    HMAC_Update(hctx, header_copy, HEADER_SIZE);
+
+    ssize_t r;
+    while ((r = read(src_fd, buffer, CHUNK_SIZE)) > 0) {
+      HMAC_Update(hctx, buffer, r);
+    }
+    uint8_t calc_tag[HMAC_SIZE];
+    HMAC_Final(hctx, calc_tag, NULL);
+
     if (CRYPTO_memcmp(stored_tag, calc_tag, HMAC_SIZE) != 0) {
-      syslog(LOG_WARNING, "{\"event\": \"auth_failure\", \"path\": \"%s\"}",
-             path);
+      syslog(LOG_WARNING, "{\"event\": \"auth_failure\", \"path\": \"%s\"}", path);
       pthread_mutex_lock(&stats.lock);
       stats.auth_failures++;
       pthread_mutex_unlock(&stats.lock);
-      munmap(src_map, st.st_size);
-      munmap(dst_map, out_size);
-      close(src_fd);
-      close(dst_fd);
-      unlink(tmp_path);
-      return;
+      goto cleanup_no_fail_count;
     }
-    memcpy(d, s + HEADER_SIZE, out_size);
-    dispatch_work(d, out_size, ks->rkeys, nonce);
+
+    // Decrypt Filename
+    dispatch_work(header + 48, NAME_SIZE, ks->rkeys, nonce, 0);
+    strncpy(name_buf, (char *)(header + 48), NAME_SIZE - 1);
+    name_buf[NAME_SIZE - 1] = '\0';
+
+    if (strchr(name_buf, '/')) {
+      syslog(LOG_CRIT, "{\"event\": \"path_traversal_attempt\", \"path\": \"%s\"}", path);
+      goto fail;
+    }
+
+    // Decrypt Body (Pass 2)
+    if (lseek(src_fd, HEADER_SIZE, SEEK_SET) != HEADER_SIZE) goto fail;
+    uint64_t ctr = NAME_SIZE / 16;
+    while ((r = read(src_fd, buffer, CHUNK_SIZE)) > 0) {
+      dispatch_work(buffer, r, ks->rkeys, nonce, ctr);
+      ctr += (r + 15) / 16;
+      if (write(dst_fd, buffer, r) != r) goto fail;
+    }
   }
-  msync(dst_map, out_size, MS_SYNC);
-  munmap(src_map, st.st_size);
-  munmap(dst_map, out_size);
+
   close(src_fd);
   close(dst_fd);
+  free(buffer);
+  HMAC_CTX_free(hctx);
+
+  // ... Rename logic ...
+  if (encrypt) {
+    char hash_hex[65];
+    uint8_t rnd_name[32];
+    get_random_bytes(rnd_name, 32);
+    for(int i=0; i<32; i++) sprintf(hash_hex + (i*2), "%02x", rnd_name[i]);
+    hash_hex[64] = 0;
+    strncpy(dir_buf, path, 4095);
+    char *last_slash = strrchr(dir_buf, '/');
+    if (last_slash) *last_slash = '\0';
+    if (last_slash) snprintf(final_path, 4096, "%s/%s.vault", dir_buf, hash_hex);
+    else snprintf(final_path, 4096, "%s.vault", hash_hex);
+  } else {
+    strncpy(dir_buf, path, 4095);
+    char *last_slash = strrchr(dir_buf, '/');
+    if (last_slash) *last_slash = '\0';
+    if (last_slash) snprintf(final_path, 4096, "%s/%s", dir_buf, name_buf);
+    else snprintf(final_path, 4096, "%s", name_buf);
+  }
 
   char old_p[4096];
   snprintf(old_p, 4096, "%s.old", path);
   if (rename(path, old_p) == 0) {
-    if (rename(tmp_path, path) == 0) {
+    if (rename(tmp_path, final_path) == 0) {
       unlink(old_p);
       pthread_mutex_lock(&stats.lock);
       stats.total_files++;
       pthread_mutex_unlock(&stats.lock);
-      printf("[+] Success: %s\n", path);
-    } else
+      printf("[+] Success: %s\n", final_path);
+    } else {
       rename(old_p, path);
+      unlink(tmp_path);
+    }
+  } else {
+    // Rename of source failed, clean up temp file
+    unlink(tmp_path);
   }
+  return;
+
+fail:
+    pthread_mutex_lock(&stats.lock);
+    stats.failed_files++;
+    pthread_mutex_unlock(&stats.lock);
+cleanup_no_fail_count:
+  if (src_fd >= 0) close(src_fd);
+  if (dst_fd >= 0) close(dst_fd);
+  if (buffer) free(buffer);
+  if (hctx) HMAC_CTX_free(hctx);
+  unlink(tmp_path);
 }
 
 void walk_dir(const char *dir, KeySet *ks, int enc) {
@@ -627,6 +732,11 @@ int main(int argc, char *argv[]) {
   // Initialize Enterprise Logging
   openlog("vibevault", LOG_PID | LOG_CONS, LOG_USER);
 
+  if (argc < 3 && strcmp(argv[1], "--keyinfo") != 0) {
+      fprintf(stderr, "Usage: %s <enc/dec> <file> [options]\n", argv[0]);
+      return 1;
+  }
+
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--rescue") == 0) {
       rescue_mode = 1;
@@ -639,8 +749,11 @@ int main(int argc, char *argv[]) {
   }
 
   if (strcmp(argv[1], "--keyinfo") == 0) {
-    if (key_dir[0] == 0)
+    if (key_dir[0] == 0 && argc > 2)
       strncpy(key_dir, argv[2], 4095);
+    else if (key_dir[0] == 0) {
+        fprintf(stderr, "[!] Missing key path\n"); return 1;
+    }
     char vf[4096];
     snprintf(vf, 4096, "%s/vault.ky", key_dir);
     FILE *f = fopen(vf, "rb");
@@ -664,7 +777,7 @@ int main(int argc, char *argv[]) {
       printf("[!] Usage: ./vibevault --check <file>\n");
       return 1;
     }
-    int fd = open(argv[2], O_RDONLY);
+    int fd = open(argv[2], O_RDONLY | O_NOFOLLOW);
     if (fd < 0) {
       perror("[!] Failed to open file");
       return 1;
@@ -687,7 +800,10 @@ int main(int argc, char *argv[]) {
   if (!rescue_mode) {
     if (key_dir[0] == 0) {
       printf("Key directory: ");
-      scanf("%4095s", key_dir);
+      // Fix: Use fgets to handle paths with spaces and prevent buffer issues
+      if (fgets(key_dir, sizeof(key_dir), stdin)) {
+        key_dir[strcspn(key_dir, "\n")] = 0;
+      }
     }
     char vf[4096];
     snprintf(vf, 4096, "%s/vault.ky", key_dir);
@@ -714,34 +830,31 @@ int main(int argc, char *argv[]) {
       return 1;
     }
   } else {
-    printf("[!!!] RESCUE MODE: Using Null Salt\n");
+    printf("[!!!] RESCUE MODE: Using Emergency Static Salt\n");
+    // Explicit 16-byte static salt (Matches first 16 chars of previous key for compat)
+    const uint8_t static_salt[SALT_SIZE] = {
+        'E', 'M', 'E', 'R', 'G', 'E', 'N', 'C',
+        'Y', '_', 'S', 'A', 'L', 'T', '_', 'V'};
+    memcpy(salt, static_salt, SALT_SIZE);
   }
 
-  char *pass = getpass("Passphrase: ");
   char up[256];
   SECURE_LOCK(up, sizeof(up));
-  strncpy(up, pass, 255);
-  up[255] = '\0';
+  read_passphrase("Passphrase: ", up, sizeof(up));
 
+  uint8_t out[KEY_SIZE + HMAC_SIZE];
   KeySet ks;
   SECURE_LOCK(&ks, sizeof(ks));
-  uint8_t out[KEY_SIZE + HMAC_SIZE];
+  SECURE_ZERO(out, sizeof(out));
+  SECURE_LOCK(out, sizeof(out));
   PKCS5_PBKDF2_HMAC(up, strlen(up), salt, SALT_SIZE, ITERATIONS, EVP_sha256(),
                     sizeof(out), out);
   memcpy(ks.aes_raw, out, KEY_SIZE);
   memcpy(ks.hmac_raw, out + KEY_SIZE, HMAC_SIZE);
-  expand_key_aes128(ks.aes_raw, ks.rkeys);
+  expand_key_aes256(ks.aes_raw, ks.rkeys);
 
   SECURE_ZERO(out, sizeof(out));
 
-  if (strcmp(argv[1], "enc") == 0 && !rescue_mode) {
-    char vf[4096];
-    snprintf(vf, 4096, "%s/vault.ky", key_dir);
-    FILE *f = fopen(vf, "a");
-    time_t n = time(NULL);
-    fprintf(f, "\n# LEDGER | TARGET: %s | DATE: %s", argv[2], ctime(&n));
-    fclose(f);
-  }
 
   stats.total_bytes = get_total_size(argv[2]);
   struct timespec start, end;
@@ -758,8 +871,9 @@ int main(int argc, char *argv[]) {
       process_file_atomic(argv[2], &ks, strcmp(argv[1], "enc") == 0);
   }
 
-  char kvf[4096];
-  snprintf(kvf, 4096, "%s/vault.ky", key_dir);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+  printf("\n[+] Finished in %.2fs\n", elapsed);
 
   SECURE_ZERO(up, sizeof(up));
   SECURE_ZERO(&ks, sizeof(ks));
