@@ -1,0 +1,11 @@
+# Build artifacts
+*.exe
+*.o
+*.obj
+
+# Local include directory (headers were downloaded for local compilation)
+# include/
+
+# Temporary files
+temp_headers/
+headers.zip
