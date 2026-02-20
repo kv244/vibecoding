@@ -214,13 +214,16 @@ int main(int argc, char **argv) {
   char device_name[128];
   clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_name), device_name,
                   NULL);
-  printf("Using device: %s\n", device_name);
-
   // Check for Unified Memory (Zero-copy optimization)
   cl_bool unified;
   clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified),
                   &unified, NULL);
   printf("Unified Memory: %s\n", unified ? "Yes" : "No");
+
+  size_t max_wg_size;
+  clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg_size),
+                  &max_wg_size, NULL);
+  printf("Max Device Work-Group Size: %zu\n", max_wg_size);
 
   context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
   checkErr(err, "clCreateContext");
@@ -239,12 +242,13 @@ int main(int argc, char **argv) {
   free(source);
   source = NULL;
 
+  // Initial build to query kernel info
   err = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
   if (err != CL_SUCCESS) {
-    char log[8192];
-    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(log),
-                          log, NULL);
-    fprintf(stderr, "Build Error:\n%s\n", log);
+    char build_log[8192];
+    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG,
+                          sizeof(build_log), build_log, NULL);
+    fprintf(stderr, "Initial Build Error:\n%s\n", build_log);
     ret = 1;
     goto cleanup;
   }
@@ -252,15 +256,36 @@ int main(int argc, char **argv) {
   kernel = clCreateKernel(program, "apply_effects", &err);
   checkErr(err, "clCreateKernel");
 
-  // Optimization: Queries for optimal Work-Group size
-  size_t preferred_wg;
+  size_t preferred_wg, kernel_max_wg;
   clGetKernelWorkGroupInfo(kernel, device,
                            CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
                            sizeof(preferred_wg), &preferred_wg, NULL);
+  clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE,
+                           sizeof(kernel_max_wg), &kernel_max_wg, NULL);
+
+  // Determine optimal and safe local_size
+  size_t local_block_size = preferred_wg;
+  if (local_block_size > kernel_max_wg)
+    local_block_size = kernel_max_wg;
+  if (local_block_size > 256)
+    local_block_size = 256; // Cap for local memory tile size safety
+
+  printf("Preferred WG: %zu, Kernel Max WG: %zu, Chosen WG: %zu\n",
+         preferred_wg, kernel_max_wg, local_block_size);
+
+  // Rebuild with TILE_SIZE macro for robustness
+  char build_options[64];
+  sprintf(build_options, "-DTILE_SIZE=%zu", local_block_size);
+  clReleaseKernel(kernel);
+  err = clBuildProgram(program, 1, &device, build_options, NULL, NULL);
+  checkErr(err, "clBuildProgram (optimized)");
+
+  kernel = clCreateKernel(program, "apply_effects", &err);
+  checkErr(err, "clCreateKernel (optimized)");
 
   // Padding: Align numSamples to local_size * 4 (for float4 vectorization)
   int samplesPerWorkItem = 4;
-  size_t alignSize = preferred_wg * samplesPerWorkItem;
+  size_t alignSize = local_block_size * samplesPerWorkItem;
   int paddedSamples = ((numSamples + alignSize - 1) / alignSize) * alignSize;
 
   // Aligned allocation for zero-copy
@@ -298,7 +323,6 @@ int main(int argc, char **argv) {
   checkErr(err, "clSetKernelArg");
 
   size_t global_size = paddedSamples / 4;
-  size_t local_block_size = preferred_wg;
   err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size,
                                &local_block_size, 0, NULL, NULL);
   checkErr(err, "clEnqueueNDRangeKernel");
@@ -309,7 +333,6 @@ int main(int argc, char **argv) {
                                           sizeof(float) * paddedSamples, 0,
                                           NULL, NULL, &map_err);
     checkErr(map_err, "clEnqueueMapBuffer");
-    // h_output is updated. We must unmap it before releasing d_out later.
     clEnqueueUnmapMemObject(queue, d_out, mapped_ptr, 0, NULL, NULL);
   } else {
     err = clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0,
@@ -325,15 +348,13 @@ int main(int argc, char **argv) {
   }
 
   out_fp = fopen(argv[2], "wb");
-  if (!out_fp) {
-    perror("Failed to open output file");
-    ret = 1;
-  } else {
+  if (out_fp) {
     fwrite(&header, sizeof(WavHeader), 1, out_fp);
     fwrite(raw_data, header.subchunk2Size, 1, out_fp);
     fclose(out_fp);
     out_fp = NULL;
-    printf("Optimized effect '%s' applied. Saved to %s\n", argv[3], argv[2]);
+    printf("Safe optimized effect '%s' applied. Saved to %s\n", argv[3],
+           argv[2]);
   }
 
 cleanup:

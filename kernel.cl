@@ -1,3 +1,7 @@
+#ifndef TILE_SIZE
+#define TILE_SIZE 256
+#endif
+
 __kernel void apply_effects(__global const float4* input, 
                            __global float4* output, 
                            const int effect_type,
@@ -8,7 +12,7 @@ __kernel void apply_effects(__global const float4* input,
     int gid = get_global_id(0);
     int lid = get_local_id(0);
     int wg  = get_local_size(0);
-    __local float4 tile[256 + 2]; // Max WG size + halo
+    __local float4 tile[TILE_SIZE + 2]; // Defined via compiler -D flag
 
     // Each work-item processes 4 samples
     if (gid * 4 >= num_samples) return;
