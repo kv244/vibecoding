@@ -112,34 +112,74 @@ __kernel void apply_effects(__global const float4* input,
             sample += input[gid - delay_vec] * 0.5f;
         }
     }
-    else if (effect_type == 8) {
-        // Auto-Wah (Modulated Low-pass Approximation)
+    else if (effect_type == 9) {
+        // Distortion (Tanh Saturation)
+        // param1 = drive (> 1.0)
+        sample = tanh(sample * param1);
+    }
+    else if (effect_type == 10) {
+        // Ring Modulation
+        // param1 = Carrier Freq
         float t = gid * 4.0f / (sample_rate * (float)num_channels);
-        float sweep = 0.5f + 0.4f * sin(6.283185f * 2.0f * t); // 2Hz sweep
-        // Use our existing filtered logic with a sweeping param
-        tile[lid + 1] = sample;
-        if (lid == 0) {
-            tile[0] = (gid > 0) ? input[gid - 1] : (float4)(0.0f);
-        }
-        if (lid == wg - 1) {
-            tile[wg + 1] = ((gid + 1) * 4 < num_samples) ? input[gid + 1] : (float4)(0.0f);
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        
-        float4 prev_v, next_v;
+        float4 offsets;
         if (num_channels == 2) {
-            // Stereo: Average samples i-2, i, i+2 (L-L-L and R-R-R)
-            // Shift vectors by 2 samples
-            prev_v = (float4)(tile[lid].z, tile[lid].w, sample.x, sample.y);
-            next_v = (float4)(sample.z, sample.w, tile[lid + 2].x, tile[lid + 2].y);
+            offsets = (float4)(0.0f, 0.0f, 1.0f/sample_rate, 1.0f/sample_rate);
         } else {
-            // Mono: Average samples i-1, i, i+1
-            // Shift vectors by 1 sample
-            prev_v = (float4)(tile[lid].w, sample.x, sample.y, sample.z);
-            next_v = (float4)(sample.y, sample.z, sample.w, tile[lid + 2].x);
+            offsets = (float4)(0.0f, 1.0f/sample_rate, 2.0f/sample_rate, 3.0f/sample_rate);
         }
-        float4 filtered = (prev_v + sample + next_v) / 3.0f;
-        sample = sample * (1.0f - sweep) + filtered * sweep;
+        float4 carrier = (float4)(
+            sin(6.283185f * param1 * (t + offsets.x)),
+            sin(6.283185f * param1 * (t + offsets.y)),
+            sin(6.283185f * param1 * (t + offsets.z)),
+            sin(6.283185f * param1 * (t + offsets.w))
+        );
+        sample *= carrier;
+    }
+    else if (effect_type == 11) {
+        // Pitch Shift (Resampling via Linear Interpolation)
+        // param1 = ratio (0.5 to 2.0)
+        __global const float* fin = (__global const float*)input;
+        float base_idx = gid * 4.0f * param1;
+        float4 out_val;
+        
+        // We handle each of the 4 samples in the float4
+        for (int i = 0; i < 4; i++) {
+            float in_idx = base_idx + (float)i * param1;
+            int i0 = (int)floor(in_idx);
+            int i1 = i0 + 1;
+            float frac = in_idx - (float)i0;
+            
+            float s0 = (i0 < num_samples) ? fin[i0] : 0.0f;
+            float s1 = (i1 < num_samples) ? fin[i1] : 0.0f;
+            
+            // Re-map index addressing to the component
+            if (i == 0) out_val.x = s0 + frac * (s1 - s0);
+            else if (i == 1) out_val.y = s0 + frac * (s1 - s0);
+            else if (i == 2) out_val.z = s0 + frac * (s1 - s0);
+            else if (i == 3) out_val.w = s0 + frac * (s1 - s0);
+        }
+        sample = out_val;
+    }
+    else if (effect_type == 12) {
+        // Noise Gate
+        // param1 = threshold, param2 = reduction (0.0 = mute)
+        float4 abs_s = fabs(sample);
+        if (abs_s.x < param1) sample.x *= param2;
+        if (abs_s.y < param1) sample.y *= param2;
+        if (abs_s.z < param1) sample.z *= param2;
+        if (abs_s.w < param1) sample.w *= param2;
+    }
+    else if (effect_type == 13) {
+        // Stereo Panning / Balance
+        // param1 = pan (-1.0 to 1.0)
+        if (num_channels == 2) {
+            float left_gain = clamp(1.0f - param1, 0.0f, 1.0f);
+            float right_gain = clamp(1.0f + param1, 0.0f, 1.0f);
+            sample.x *= left_gain;  // L
+            sample.y *= right_gain; // R
+            sample.z *= left_gain;  // L
+            sample.w *= right_gain; // R
+        }
     }
 
     output[gid] = clamp(sample, -1.0f, 1.0f);

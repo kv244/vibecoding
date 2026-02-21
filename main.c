@@ -148,6 +148,11 @@ int main(int argc, char **argv) {
     printf("  pingpong <delay> <decay>(e.g., pingpong 8820 0.5)\n");
     printf("  chorus                  (preset sweep)\n");
     printf("  autowah                 (preset sweep)\n");
+    printf("  distortion <drive>      (e.g., distortion 5.0)\n");
+    printf("  ringmod <freq>          (e.g., ringmod 440)\n");
+    printf("  pitch <ratio>           (e.g., pitch 1.5)\n");
+    printf("  gate <threshold> <red>  (e.g., gate 0.1 0.0)\n");
+    printf("  pan <value>             (e.g., pan -0.5 [L..R])\n");
     printf("\nOptions:\n");
     printf("  --visualize             Display ASCII waveform\n");
     return 1;
@@ -194,6 +199,22 @@ int main(int argc, char **argv) {
     effect_type = 7;
   } else if (strcmp(argv[3], "autowah") == 0) {
     effect_type = 8;
+  } else if (strcmp(argv[3], "distortion") == 0) {
+    effect_type = 9;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 2.0f; // Drive
+  } else if (strcmp(argv[3], "ringmod") == 0) {
+    effect_type = 10;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 440.0f; // Freq
+  } else if (strcmp(argv[3], "pitch") == 0) {
+    effect_type = 11;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 1.5f; // Ratio
+  } else if (strcmp(argv[3], "gate") == 0) {
+    effect_type = 12;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 0.1f; // Threshold
+    param2 = (argc > 5) ? (float)atof(argv[5]) : 0.0f; // Reduction
+  } else if (strcmp(argv[3], "pan") == 0) {
+    effect_type = 13;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 0.0f; // Pan [-1, 1]
   } else {
     printf("Unknown effect: %s\n", argv[3]);
     return 1;
