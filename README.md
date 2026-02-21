@@ -74,6 +74,22 @@ Run the executable with an input WAV file (uncompressed PCM, 16-bit) and specify
 
 ### Effects & Parameters:
 
+## 📊 Visualization
+
+CLFX provides two ways to visualize your audio waveforms:
+
+### 1. Instant CLI Visualization
+Use the `--visualize` flag after any effect to see a peak-amplitude ASCII bar chart in your terminal:
+```bash
+./clfx.exe input.wav output.wav gain 1.5 --visualize
+```
+
+### 2. High-Resolution Python Plotting
+For detailed analysis, use the provided `visualize.py` script. It generates a high-quality `waveform.png` if `matplotlib` is installed, or falls back to a precise ASCII view.
+```bash
+python visualize.py output.wav
+```
+
 | Effect | Parameter 1 | Parameter 2 | Example |
 | :--- | :--- | :--- | :--- |
 | `gain` | Multiplier | - | `gain 1.5` |

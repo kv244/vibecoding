@@ -7,7 +7,8 @@ __kernel void apply_effects(__global const float4* input,
                            const int effect_type,
                            const float param1,
                            const float param2,
-                           const int num_samples) 
+                           const int num_samples,
+                           const float sample_rate) 
 {
     int gid = get_global_id(0);
     int lid = get_local_id(0);
@@ -56,12 +57,12 @@ __kernel void apply_effects(__global const float4* input,
     else if (effect_type == 4) {
         // Tremolo (Amplitude Modulation)
         // param1 = freq (Hz), param2 = depth (0-1)
-        float t = gid * 4.0f / 44100.0f; // Simplified time
+        float t = gid * 4.0f / sample_rate; // Dynamic time
         float4 lfo = 1.0f - param2 + param2 * (float4)(
             sin(6.283185f * param1 * t),
-            sin(6.283185f * param1 * (t + 1.0f/44100.0f)),
-            sin(6.283185f * param1 * (t + 2.0f/44100.0f)),
-            sin(6.283185f * param1 * (t + 3.0f/44100.0f))
+            sin(6.283185f * param1 * (t + 1.0f/sample_rate)),
+            sin(6.283185f * param1 * (t + 2.0f/sample_rate)),
+            sin(6.283185f * param1 * (t + 3.0f/sample_rate))
         );
         sample *= lfo;
     }
@@ -87,7 +88,7 @@ __kernel void apply_effects(__global const float4* input,
     else if (effect_type == 7) {
         // Chorus (Modulated Delay)
         // Simplified: Fixed small sine modulation of read address
-        float t = gid * 4.0f / 44100.0f;
+        float t = gid * 4.0f / sample_rate;
         float mod = sin(6.283185f * 0.25f * t) * 100.0f + 200.0f; // 0.25Hz sweep
         int delay_vec = (int)mod / 4;
         if (gid >= delay_vec) {
@@ -96,7 +97,7 @@ __kernel void apply_effects(__global const float4* input,
     }
     else if (effect_type == 8) {
         // Auto-Wah (Modulated Low-pass Approximation)
-        float t = gid * 4.0f / 44100.0f;
+        float t = gid * 4.0f / sample_rate;
         float sweep = 0.5f + 0.4f * sin(6.283185f * 2.0f * t); // 2Hz sweep
         // Use our existing filtered logic with a sweeping param
         tile[lid + 1] = sample;

@@ -59,6 +59,32 @@ typedef struct {
   uint32_t subchunk2Size;
 } WavHeader;
 
+void draw_waveform_ascii(const float *data, int numSamples, int width) {
+  if (numSamples <= 0)
+    return;
+  printf("\nWaveform Visualization (Peak Amplitude):\n");
+  int samplesPerCol = numSamples / width;
+  if (samplesPerCol < 1)
+    samplesPerCol = 1;
+
+  for (int i = 0; i < width && i * samplesPerCol < numSamples; i++) {
+    float peak = 0.0f;
+    for (int j = 0; j < samplesPerCol; j++) {
+      float val = fabsf(data[i * samplesPerCol + j]);
+      if (val > peak)
+        peak = val;
+    }
+    int barLen = (int)(peak * 50.0f);
+    if (barLen > 50)
+      barLen = 50;
+    printf("%3d%% |", (int)(peak * 100));
+    for (int k = 0; k < barLen; k++)
+      printf("#");
+    printf("\n");
+  }
+  printf("\n");
+}
+
 char *load_kernel_source(const char *filename) {
   FILE *fp = fopen(filename, "rb");
   if (!fp)
@@ -122,7 +148,17 @@ int main(int argc, char **argv) {
     printf("  pingpong <delay> <decay>(e.g., pingpong 8820 0.5)\n");
     printf("  chorus                  (preset sweep)\n");
     printf("  autowah                 (preset sweep)\n");
+    printf("\nOptions:\n");
+    printf("  --visualize             Display ASCII waveform\n");
     return 1;
+  }
+
+  int do_visualize = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--visualize") == 0) {
+      do_visualize = 1;
+      break;
+    }
   }
 
   int effect_type = 0;
@@ -220,19 +256,36 @@ int main(int argc, char **argv) {
   }
   cl_platform_id *platforms = malloc(sizeof(cl_platform_id) * num_platforms);
   clGetPlatformIDs(num_platforms, platforms, NULL);
-  platform = platforms[0];
+
+  int found_device = 0;
+  // 1. Search for a GPU on any platform
+  for (cl_uint i = 0; i < num_platforms; i++) {
+    err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 1, &device, NULL);
+    if (err == CL_SUCCESS) {
+      platform = platforms[i];
+      found_device = 1;
+      break;
+    }
+  }
+
+  // 2. Fallback: Search for a CPU on any platform
+  if (!found_device) {
+    for (cl_uint i = 0; i < num_platforms; i++) {
+      err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_CPU, 1, &device, NULL);
+      if (err == CL_SUCCESS) {
+        printf("No GPU found, falling back to CPU...\n");
+        platform = platforms[i];
+        found_device = 1;
+        break;
+      }
+    }
+  }
   free(platforms);
 
-  char platform_name[128];
-  clGetPlatformInfo(platform, CL_PLATFORM_NAME, sizeof(platform_name),
-                    platform_name, NULL);
-  printf("Using platform: %s\n", platform_name);
-
-  err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
-  if (err != CL_SUCCESS) {
-    printf("Falling back to CPU...\n");
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL);
-    checkErr(err, "clGetDeviceIDs (CPU)");
+  if (!found_device) {
+    fprintf(stderr, "No OpenCL devices (GPU or CPU) found.\n");
+    ret = 1;
+    goto cleanup;
   }
 
   char device_name[128];
@@ -339,12 +392,20 @@ int main(int argc, char **argv) {
   checkErr(err, "clCreateBuffer (d_out)");
 
   err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in);
-  err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out);
-  err |= clSetKernelArg(kernel, 2, sizeof(int), &effect_type);
-  err |= clSetKernelArg(kernel, 3, sizeof(float), &param1);
-  err |= clSetKernelArg(kernel, 4, sizeof(float), &param2);
-  err |= clSetKernelArg(kernel, 5, sizeof(int), &numSamples);
-  checkErr(err, "clSetKernelArg");
+  checkErr(err, "clSetKernelArg (d_in)");
+  err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out);
+  checkErr(err, "clSetKernelArg (d_out)");
+  err = clSetKernelArg(kernel, 2, sizeof(int), &effect_type);
+  checkErr(err, "clSetKernelArg (effect_type)");
+  err = clSetKernelArg(kernel, 3, sizeof(float), &param1);
+  checkErr(err, "clSetKernelArg (param1)");
+  err = clSetKernelArg(kernel, 4, sizeof(float), &param2);
+  checkErr(err, "clSetKernelArg (param2)");
+  err = clSetKernelArg(kernel, 5, sizeof(int), &numSamples);
+  checkErr(err, "clSetKernelArg (numSamples)");
+  float fs = (float)header.sampleRate;
+  err = clSetKernelArg(kernel, 6, sizeof(float), &fs);
+  checkErr(err, "clSetKernelArg (sampleRate)");
 
   size_t global_size = paddedSamples / 4;
   err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size,
@@ -381,6 +442,11 @@ int main(int argc, char **argv) {
            argv[2]);
   }
 
+  if (do_visualize) {
+    draw_waveform_ascii(h_output, numSamples, 40);
+  }
+
+  ret = 0;
 cleanup:
   if (fp)
     fclose(fp);
