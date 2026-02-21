@@ -42,6 +42,21 @@ To compile the engine using GCC on Windows (Cygwin or MinGW):
 gcc -Iinclude main.c -o clfx.exe C:\Windows\System32\OpenCL.dll -lm -std=c99 -D_POSIX_C_SOURCE=200112L
 ```
 
+### Linux & Raspberry Pi (Raspberry Pi OS / Ubuntu)
+
+Install the OpenCL headers and a compatible OpenCL implementation (like `pocl` for CPU compatibility if a dedicated GPU driver isn't present):
+
+```bash
+sudo apt-get update
+sudo apt-get install ocl-icd-opencl-dev pocl-opencl-icd build-essential -y
+```
+
+Then compile using `gcc`:
+
+```bash
+gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L
+```
+
 ## 🧪 Generating Test Audio
 
 You can use the following Python snippet to generate a stereo test WAV file (440Hz sine in Left, 880Hz in Right):
