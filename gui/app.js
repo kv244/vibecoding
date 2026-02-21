@@ -18,7 +18,7 @@ const fxConfig = {
     echo: { name: 'Echo / Delay', desc: "Repeats the signal over time.", params: [{ id: 'p1', label: 'Delay (smp)', min: 100, max: 40000, step: 100, default: 4410 }, { id: 'p2', label: 'Decay', min: 0, max: 1, step: 0.05, default: 0.5 }] },
     pingpong: { name: 'Ping-Pong Delay', desc: "Stereo delay bouncing left and right.", params: [{ id: 'p1', label: 'Delay (smp)', min: 100, max: 40000, step: 100, default: 8820 }, { id: 'p2', label: 'Decay', min: 0, max: 1, step: 0.05, default: 0.5 }] },
     reverb: { name: 'Reverb (Alg)', desc: "Simulates acoustic space via algorithms.", params: [{ id: 'p1', label: 'Size', min: 0, max: 1, step: 0.05, default: 0.6 }, { id: 'p2', label: 'Mix', min: 0, max: 1, step: 0.05, default: 0.5 }] },
-    convolve: { name: 'Convolution Reverb', desc: "Applies an impulse response file (FFT based).", params: [{ id: 'ir', label: 'IR File', type: 'text', default: 'ir.wav' }] },
+    convolve: { name: 'Convolution Reverb', desc: "Applies an impulse response file (FFT based). A default room 'ir.wav' is provided, or type the name of an IR file you uploaded.", params: [{ id: 'ir', label: 'IR File', type: 'text', default: 'ir.wav' }] },
     freeze: { name: 'Spectral Freeze', desc: "Smears transients via random phases.", params: [] }
 };
 
