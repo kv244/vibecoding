@@ -171,6 +171,12 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
+  printf("Input WAV: %s\n", argv[1]);
+  printf("  Channels:    %d (%s)\n", header.numChannels,
+         (header.numChannels == 1) ? "Mono" : "Stereo");
+  printf("  Sample Rate: %u Hz\n", header.sampleRate);
+  printf("  Data Size:   %u bytes\n", header.subchunk2Size);
+
   int numSamples = header.subchunk2Size / sizeof(int16_t);
   raw_data = malloc(header.subchunk2Size);
   if (!raw_data) {
