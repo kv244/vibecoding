@@ -535,3 +535,85 @@ input[type="range"] {
     letter-spacing: 0.12em;
     color: var(--primary);
 }
+
+/* ── WAV Conversion Hint Banner ──────────────────── */
+.convert-hint {
+    background: rgba(255, 180, 0, 0.08);
+    border: 1px solid rgba(255, 180, 0, 0.35);
+    border-radius: 10px;
+    padding: 1rem;
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+}
+
+.convert-hint-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-weight: 700;
+    color: #ffb400;
+    margin-bottom: 0.5rem;
+}
+
+.hint-close {
+    background: none;
+    border: none;
+    color: #8892b0;
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 0 4px;
+    transition: color 0.2s;
+}
+
+.hint-close:hover {
+    color: #fff;
+}
+
+#convert-hint-msg {
+    color: #ccd6f6;
+    margin-bottom: 0.5rem;
+    font-size: 0.8rem;
+}
+
+.convert-hint-label {
+    color: #8892b0;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.35rem;
+}
+
+.convert-cmd-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+}
+
+.convert-cmd-row code {
+    flex: 1;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: #00f2ff;
+    white-space: nowrap;
+    overflow: auto;
+}
+
+.copy-btn {
+    background: rgba(0, 242, 255, 0.12);
+    border: 1px solid rgba(0, 242, 255, 0.3);
+    color: #00f2ff;
+    border-radius: 5px;
+    padding: 3px 10px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.2s;
+    flex-shrink: 0;
+}
+
+.copy-btn:hover {
+    background: rgba(0, 242, 255, 0.25);
+}

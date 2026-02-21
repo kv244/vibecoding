@@ -203,15 +203,28 @@ async function handleFileSelection(file) {
         const result = await response.json();
         if (result.success) {
             currentInputFile = result.filename;
-            uploadHint.innerText = "Upload Complete!";
-            showToast("File uploaded successfully");
+            uploadHint.innerText = result.info || 'Upload Complete!';
+            selectedFileName.innerText = `Selected: ${file.name}`;
+            document.getElementById('convert-hint').classList.add('hidden');
+            showToast('✅ File uploaded');
         } else {
-            showToast(`Upload failed: ${result.error}`, 5000);
-            uploadHint.innerText = "Upload Failed. Try again.";
+            uploadHint.innerText = 'Upload Failed — see hint below';
+            selectedFileName.innerText = '';
+            // Check if it's a bit-depth error — show the conversion hint banner
+            const isBitDepthError = result.error && result.error.includes('16-bit');
+            if (isBitDepthError) {
+                const baseName = file.name.replace(/\.[^.]+$/, '');
+                const cmd = `ffmpeg -i "${file.name}" -acodec pcm_s16le -ar 44100 "${baseName}_16bit.wav"`;
+                document.getElementById('convert-hint-msg').innerText = result.error;
+                document.getElementById('convert-cmd').innerText = cmd;
+                document.getElementById('convert-hint').classList.remove('hidden');
+            } else {
+                showToast(`Upload failed: ${result.error}`, 5000);
+            }
         }
     } catch (e) {
         showToast(`Server error during upload: ${e.message}`, 5000);
-        uploadHint.innerText = "Server Error. Try again.";
+        uploadHint.innerText = 'Server Error. Try again.';
     }
 }
 

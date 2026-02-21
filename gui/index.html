@@ -30,6 +30,20 @@
                     </div>
                 </div>
 
+                                <!-- 16-bit conversion hint -->
+                <div id="convert-hint" class="convert-hint hidden" role="alert">
+                    <div class="convert-hint-header">
+                        <span>&#9888;&#65039; Wrong WAV Format</span>
+                        <button class="hint-close" onclick="document.getElementById('convert-hint').classList.add('hidden')" aria-label="Dismiss">&#x2715;</button>
+                    </div>
+                    <p id="convert-hint-msg"></p>
+                    <p class="convert-hint-label">Convert with ffmpeg:</p>
+                    <div class="convert-cmd-row">
+                        <code id="convert-cmd"></code>
+                        <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('convert-cmd').innerText).then(()=>this.innerText='&#10003; Copied').catch(()=>{})" aria-label="Copy command">Copy</button>
+                    </div>
+                </div>
+
                 <div class="input-group" style="margin-top: 1.5rem;">
                     <label for="outputFile"><span class="icon">💾</span> Output Filename</label>
                     <input type="text" id="outputFile" placeholder="processed.wav" value="processed.wav">
@@ -107,3 +121,4 @@
 </body>
 
 </html>
+

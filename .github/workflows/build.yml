@@ -7,34 +7,35 @@ on:
     branches: [ master, main ]
 
 jobs:
+  # ─── Linux Build & Functional Tests ───────────────────────────────────────
   build-linux:
+    name: Linux (OpenCL)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Install OpenCL Headers and Runtime
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd
-        
+
+    - name: Install OpenCL
+      run: sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd
+
     - name: Compile Engine
-      run: |
-        gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L
-        
-    - name: Verify Binary Info
+      run: gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L
+
+    - name: Query Binary Info
       run: |
         ./clfx --info
+        echo "Exit: $?"
 
     - name: Generate Functional Test Input
       run: |
-        python3 - <<EOF
+        python3 - <<'EOF'
         import wave, struct, math
         sample_rate = 44100
-        f = wave.open('input.wav', 'wb')
+        duration = 2
+        f = wave.open('input.wav', 'w')
         f.setnchannels(2)
         f.setsampwidth(2)
         f.setframerate(sample_rate)
-        for i in range(44100):
+        for i in range(sample_rate * duration):
             val = int(32767 * math.sin(2 * math.pi * 440 * i / sample_rate))
             f.writeframesraw(struct.pack('<hh', val, val))
         f.close()
@@ -45,13 +46,74 @@ jobs:
         ./clfx input.wav out_gain.wav gain 1.5
         ./clfx input.wav out_lp.wav lowpass 0.8
         ./clfx input.wav out_echo.wav echo 4410 0.5
-        
+
     - name: Test Advanced Effects (Spectral, Dynamics)
       run: |
         ./clfx input.wav out_bit.wav bitcrush 8
         ./clfx input.wav out_freeze.wav freeze 0.5 0.5
         ./clfx input.wav out_gate.wav gate 0.1 0.0
-        
-    - name: Verify Outputs Generated
+
+    - name: Verify Linux Outputs Generated
+      run: ls -lh out_*.wav
+
+    - name: Upload Linux Binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: clfx-linux
+        path: clfx
+
+  # ─── Windows Native Build (MSYS2 / MinGW-w64) ────────────────────────────
+  build-windows:
+    name: Windows (MSYS2 / MinGW-w64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up MSYS2 with MinGW-w64
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-opencl-headers
+          mingw-w64-x86_64-opencl-icd
+
+    - name: Compile Engine (native Windows PE)
       run: |
-        ls -lh out_*.wav
+        gcc -Iinclude main.c -o clfx.exe \
+          -lOpenCL -lm -std=c99 \
+          -D_POSIX_C_SOURCE=200112L \
+          -D_WIN32_WINNT=0x0601
+
+    - name: Verify Windows Binary Runs
+      run: |
+        file clfx.exe
+        ./clfx.exe --info || true   # info probe (non-zero exit ok if no GPU)
+
+    - name: Generate Test WAV and Run Effects
+      run: |
+        python3 - <<'EOF'
+        import wave, struct, math
+        sample_rate = 44100
+        f = wave.open('input.wav', 'w')
+        f.setnchannels(2); f.setsampwidth(2); f.setframerate(sample_rate)
+        for i in range(sample_rate * 2):
+            val = int(32767 * math.sin(2 * math.pi * 440 * i / sample_rate))
+            f.writeframesraw(struct.pack('<hh', val, val))
+        f.close()
+        EOF
+        ./clfx.exe input.wav out_gain.wav gain 1.5
+        ./clfx.exe input.wav out_echo.wav echo 4410 0.5
+
+    - name: Verify Windows Outputs Generated
+      run: ls -lh out_*.wav
+
+    - name: Upload Windows Binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: clfx-windows
+        path: clfx.exe
