@@ -202,6 +202,62 @@ int main(int argc, char *argv[]) {
   cl_mem d_initial_in = NULL, d_initial_out = NULL;
   cl_int err;
 
+  // Handle --info early
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--info") == 0) {
+      printf("CLFX Engine Version: %s\n", CLFX_VERSION);
+      printf("OS: ");
+#ifdef _WIN32
+      printf("Windows\n");
+#elif __APPLE__
+      printf("macOS\n");
+#elif __linux__
+      printf("Linux\n");
+#else
+      printf("Unknown\n");
+#endif
+
+      cl_uint n_platforms;
+      if (clGetPlatformIDs(0, NULL, &n_platforms) == CL_SUCCESS &&
+          n_platforms > 0) {
+        cl_platform_id *plat_list =
+            malloc(sizeof(cl_platform_id) * n_platforms);
+        clGetPlatformIDs(n_platforms, plat_list, NULL);
+        for (cl_uint p = 0; p < n_platforms; p++) {
+          char p_name[128], p_vendor[128], p_ver[128];
+          clGetPlatformInfo(plat_list[p], CL_PLATFORM_NAME, sizeof(p_name),
+                            p_name, NULL);
+          clGetPlatformInfo(plat_list[p], CL_PLATFORM_VENDOR, sizeof(p_vendor),
+                            p_vendor, NULL);
+          clGetPlatformInfo(plat_list[p], CL_PLATFORM_VERSION, sizeof(p_ver),
+                            p_ver, NULL);
+          printf("Platform[%u]: %s (%s) %s\n", p, p_name, p_vendor, p_ver);
+
+          cl_uint n_devices;
+          if (clGetDeviceIDs(plat_list[p], CL_DEVICE_TYPE_ALL, 0, NULL,
+                             &n_devices) == CL_SUCCESS) {
+            cl_device_id *dev_list = malloc(sizeof(cl_device_id) * n_devices);
+            clGetDeviceIDs(plat_list[p], CL_DEVICE_TYPE_ALL, n_devices,
+                           dev_list, NULL);
+            for (cl_uint d = 0; d < n_devices; d++) {
+              char d_name[128], d_ver[128];
+              clGetDeviceInfo(dev_list[d], CL_DEVICE_NAME, sizeof(d_name),
+                              d_name, NULL);
+              clGetDeviceInfo(dev_list[d], CL_DEVICE_VERSION, sizeof(d_ver),
+                              d_ver, NULL);
+              printf("  Device[%u]: %s [%s]\n", d, d_name, d_ver);
+            }
+            free(dev_list);
+          }
+        }
+        free(plat_list);
+      } else {
+        printf("OpenCL: No platforms found or Error.\n");
+      }
+      return 0; // Success exit for info probe
+    }
+  }
+
   if (argc < 4) {
     printf("Usage: %s <input.wav> <output.wav> <effect> [param1] [param2]\n",
            argv[0]);
