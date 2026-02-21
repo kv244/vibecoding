@@ -406,6 +406,9 @@ int main(int argc, char **argv) {
   float fs = (float)header.sampleRate;
   err = clSetKernelArg(kernel, 6, sizeof(float), &fs);
   checkErr(err, "clSetKernelArg (sampleRate)");
+  int numChans = (int)header.numChannels;
+  err = clSetKernelArg(kernel, 7, sizeof(int), &numChans);
+  checkErr(err, "clSetKernelArg (numChannels)");
 
   size_t global_size = paddedSamples / 4;
   err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size,
@@ -440,6 +443,10 @@ int main(int argc, char **argv) {
     out_fp = NULL;
     printf("Safe optimized effect '%s' applied. Saved to %s\n", argv[3],
            argv[2]);
+  } else {
+    perror("Failed to open output file for writing");
+    ret = 1;
+    goto cleanup;
   }
 
   if (do_visualize) {
