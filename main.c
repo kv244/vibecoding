@@ -114,10 +114,14 @@ int main(int argc, char **argv) {
            argv[0]);
     printf("Effects:\n");
     printf("  gain <multiplier>       (e.g., gain 1.5)\n");
-    printf("  echo <delay_samples> <decay> (e.g., echo 4410 0.5) [One-shot "
-           "reflection]\n");
+    printf("  echo <delay_samples> <decay> (e.g., echo 4410 0.5)\n");
     printf("  lowpass <strength>      (e.g., lowpass 0.8)\n");
     printf("  bitcrush <bits>         (e.g., bitcrush 8)\n");
+    printf("  tremolo <freq> <depth>  (e.g., tremolo 5.0 0.5)\n");
+    printf("  widening <width>        (e.g., widening 1.5) [Stereo Only]\n");
+    printf("  pingpong <delay> <decay>(e.g., pingpong 8820 0.5)\n");
+    printf("  chorus                  (preset sweep)\n");
+    printf("  autowah                 (preset sweep)\n");
     return 1;
   }
 
@@ -138,8 +142,22 @@ int main(int argc, char **argv) {
   } else if (strcmp(argv[3], "bitcrush") == 0) {
     effect_type = 3;
     float bits = (argc > 4) ? (float)atof(argv[4]) : 8.0f;
-    // Optimization: Precompute levels on CPU
     param1 = powf(2.0f, roundf(bits));
+  } else if (strcmp(argv[3], "tremolo") == 0) {
+    effect_type = 4;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 5.0f;
+    param2 = (argc > 5) ? (float)atof(argv[5]) : 0.5f;
+  } else if (strcmp(argv[3], "widening") == 0) {
+    effect_type = 5;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 1.5f;
+  } else if (strcmp(argv[3], "pingpong") == 0) {
+    effect_type = 6;
+    param1 = (argc > 4) ? (float)atof(argv[4]) : 8820.0f;
+    param2 = (argc > 5) ? (float)atof(argv[5]) : 0.5f;
+  } else if (strcmp(argv[3], "chorus") == 0) {
+    effect_type = 7;
+  } else if (strcmp(argv[3], "autowah") == 0) {
+    effect_type = 8;
   } else {
     printf("Unknown effect: %s\n", argv[3]);
     return 1;

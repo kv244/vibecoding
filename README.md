@@ -29,10 +29,39 @@ A high-performance, hardened, and multiplatform-safe OpenCL audio processing eng
 
 ## 🔨 Building
 
-To compile the engine using GCC on Windows:
+To compile the engine using GCC on Windows (Cygwin or MinGW):
 
 ```bash
+# Ensure you have the OpenCL.dll path correct for your system
+# This command uses the provides /include folder and links against the system OpenCL
 gcc -Iinclude main.c -o clfx.exe C:\Windows\System32\OpenCL.dll -lm -std=c99 -D_POSIX_C_SOURCE=200112L
+```
+
+## 🧪 Generating Test Audio
+
+You can use the following Python snippet to generate a stereo test WAV file (440Hz sine in Left, 880Hz in Right):
+
+```python
+import wave, struct, math
+
+def generate_test_wav(filename='test_input.wav', duration_sec=1.0):
+    sample_rate = 44100
+    f = wave.open(filename, 'wb')
+    f.setnchannels(2)
+    f.setsampwidth(2)
+    f.setframerate(sample_rate)
+    
+    num_samples = int(sample_rate * duration_sec)
+    for i in range(num_samples):
+        # Left: 440Hz, Right: 880Hz
+        val_l = int(32767 * math.sin(2 * math.pi * 440 * i / sample_rate))
+        val_r = int(32767 * math.sin(2 * math.pi * 880 * i / sample_rate))
+        f.writeframesraw(struct.pack('<hh', val_l, val_r))
+    f.close()
+    print(f"Generated {filename}")
+
+if __name__ == "__main__":
+    generate_test_wav()
 ```
 
 ## 🎯 Usage
@@ -51,6 +80,11 @@ Run the executable with an input WAV file (uncompressed PCM, 16-bit) and specify
 | `echo` | Delay (samples) | Decay (0.0 - 1.0) | `echo 4410 0.5` |
 | `lowpass` | Strength (0.0 - 1.0) | - | `lowpass 0.8` |
 | `bitcrush`| Bits (1 - 16) | - | `bitcrush 8` |
+| `tremolo` | Frequency (Hz) | Depth (0.0 - 1.0) | `tremolo 5.0 0.8` |
+| `widening`| Width (>1.0) | - | `widening 1.5` |
+| `pingpong`| Delay (samples) | Decay (0.0 - 1.0) | `pingpong 8820 0.5` |
+| `chorus`  | - | - | `chorus` |
+| `autowah` | - | - | `autowah` |
 
 ## 🛡️ Hardening & Safety
 
