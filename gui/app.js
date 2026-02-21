@@ -306,9 +306,9 @@ processBtn.addEventListener('click', async () => {
 
         const result = await response.json();
         if (result.success) {
-            showToast(`Success! Generated ${result.output}`);
+            showToast(`✅ Generated ${result.output}`);
 
-            // Handle Audio Preview
+            // Audio preview
             if (result.audio) {
                 const audioContainer = document.getElementById('audio-container');
                 const audioPlayer = document.getElementById('outputAudio');
@@ -317,13 +317,9 @@ processBtn.addEventListener('click', async () => {
                 audioContainer.classList.remove('hidden');
             }
 
-            // Handle Waveform
-            if (result.waveform) {
-                const vizContainer = document.getElementById('viz-container');
-                const vizImg = document.getElementById('waveformImg');
-                vizImg.src = `${result.waveform}?t=${Date.now()}`;
-                vizContainer.classList.remove('hidden');
-            }
+            // Canvas waveform visualization
+            fetchAndDrawWaveform(result.output);
+
         } else {
             const errMsg = result.error || result.stderr || 'Unknown engine error. Is clfx.exe compiled?';
             showToast(`Error: ${errMsg}`, 6000);
@@ -344,6 +340,70 @@ function showToast(msg, duration = 3000) {
 
 function showLoader(show) {
     document.getElementById('loader').classList.toggle('hidden', !show);
+}
+
+// --- Waveform Canvas Renderer ---
+
+async function fetchAndDrawWaveform(outputFilename) {
+    try {
+        const resp = await fetch('/visualize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: outputFilename })
+        });
+        const data = await resp.json();
+        if (data.error) { console.warn('Waveform error:', data.error); return; }
+
+        const vizContainer = document.getElementById('viz-container');
+        const canvas = document.getElementById('waveformCanvas');
+        const meta = document.getElementById('viz-meta');
+        meta.innerText = `${data.channels}ch · ${data.sample_rate}Hz · ${data.duration}s`;
+        vizContainer.classList.remove('hidden');
+
+        drawChannel(canvas, data.peaks_l, data.peaks_r, data.channels > 1);
+    } catch (e) {
+        console.warn('Visualization fetch failed:', e);
+    }
+}
+
+function drawChannel(canvas, peaksL, peaksR, isStereo) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.offsetWidth || 900;
+    const H = isStereo ? 200 : 120;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.height = `${H}px`;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.fillRect(0, 0, W, H);
+
+    const drawPeaks = (peaks, yOff, rowH, color) => {
+        const mid = yOff + rowH / 2;
+        const grad = ctx.createLinearGradient(0, yOff, 0, yOff + rowH);
+        grad.addColorStop(0, color + 'aa');
+        grad.addColorStop(0.5, color);
+        grad.addColorStop(1, color + 'aa');
+        ctx.fillStyle = grad;
+        const bw = W / peaks.length;
+        for (let i = 0; i < peaks.length; i++) {
+            const h = peaks[i] * rowH * 0.48;
+            ctx.fillRect(i * bw, mid - h, Math.max(1, bw - 0.5), h * 2);
+        }
+        // Centre line
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(W, mid); ctx.stroke();
+    };
+
+    if (isStereo) {
+        drawPeaks(peaksL, 0, H / 2, '#00f2ff');
+        drawPeaks(peaksR, H / 2, H / 2, '#bc13fe');
+    } else {
+        drawPeaks(peaksL, 0, H, '#00f2ff');
+    }
 }
 
 // --- Startup ---

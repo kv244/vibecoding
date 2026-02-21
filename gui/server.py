@@ -144,7 +144,9 @@ def process():
             except (ValueError, TypeError):
                 return jsonify({"error": f"Invalid numeric parameter in {fx_type}"}), 400
 
-    cmd.extend(['--mix', str(global_mix)])
+    # Apply master mix as a final gain stage if not at unity (engine has no --mix flag)
+    if abs(global_mix - 1.0) > 0.01:
+        cmd.extend(['gain', str(global_mix)])
 
     try:
         print(f"Executing: {' '.join(cmd)}")
@@ -187,6 +189,51 @@ def process():
         return jsonify({"success": False, "error": "Processing timed out after 120 seconds"}), 504
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/visualize', methods=['POST'])
+def visualize():
+    """Read a WAV file from output dir and return downsampled peak data for browser canvas rendering."""
+    data = request.json
+    filename = data.get('file', '')
+    filename = os.path.basename(filename)  # Safety: strip paths
+    full_path = os.path.join(OUTPUT_DIR, filename)
+
+    if not os.path.exists(full_path):
+        return jsonify({"error": f"File not found: {filename}"}), 404
+
+    try:
+        import wave, struct
+        with wave.open(full_path, 'rb') as wf:
+            channels = wf.getnchannels()
+            frames = wf.getnframes()
+            fs = wf.getframerate()
+            raw = wf.readframes(frames)
+
+        fmt = f"<{frames * channels}h"
+        samples = struct.unpack(fmt, raw)
+
+        # Downsample to ~1000 peak blocks for canvas
+        NUM_BLOCKS = 1000
+        samples_per_block = max(1, len(samples) // (NUM_BLOCKS * channels))
+        peaks_l, peaks_r = [], []
+        for b in range(NUM_BLOCKS):
+            start = b * samples_per_block * channels
+            chunk_l = [abs(samples[i]) / 32768.0 for i in range(start, min(start + samples_per_block * channels, len(samples)), channels)]
+            peaks_l.append(max(chunk_l) if chunk_l else 0)
+            if channels > 1:
+                chunk_r = [abs(samples[i]) / 32768.0 for i in range(start + 1, min(start + samples_per_block * channels + 1, len(samples)), channels)]
+                peaks_r.append(max(chunk_r) if chunk_r else 0)
+
+        return jsonify({
+            "channels": channels,
+            "sample_rate": fs,
+            "duration": round(frames / fs, 2),
+            "peaks_l": peaks_l,
+            "peaks_r": peaks_r if channels > 1 else peaks_l
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     is_debug = os.environ.get('DEBUG', 'false').lower() == 'true'
