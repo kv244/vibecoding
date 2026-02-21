@@ -25,6 +25,12 @@ UPLOADS_DIR = '/tmp/clfx_uploads' if _is_cloud else os.path.join(GUI_DIR, 'uploa
 
 GUI_VERSION = "1.0.1"
 
+VALID_EFFECTS = {
+    'gain', 'pan', 'eq', 'lowpass', 'distortion', 'bitcrush', 'compress', 'gate',
+    'autowah', 'chorus', 'flange', 'phase', 'tremolo', 'widening', 'ringmod',
+    'pitch', 'echo', 'pingpong', 'reverb', 'convolve', 'freeze'
+}
+
 for d in [OUTPUT_DIR, UPLOADS_DIR]:
     os.makedirs(d, exist_ok=True)
 
@@ -88,15 +94,18 @@ def upload_file():
         return jsonify({"success": True, "filename": safe_filename,
                         "info": f"Loaded: {ch}ch 16-bit PCM"})
 
+
     return jsonify({"success": False, "error": "Only WAV files allowed"}), 400
 
 @app.route('/')
 def index():
     return send_from_directory(GUI_DIR, 'index.html')
 
-@app.route('/<path:path>')
-def static_files(path):
-    return send_from_directory(GUI_DIR, path)
+@app.route('/download/<filename>', methods=['GET'])
+def download_file(filename):
+    # Ensure we only serve from the output directory
+    filename = os.path.basename(filename)
+    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
 @app.route('/system-info', methods=['GET'])
 def get_system_info():
@@ -107,6 +116,7 @@ def get_system_info():
         "engine_version": "Unknown",
         "engine": "Unknown"
     }
+
     
     try:
         # Run engine with --info
@@ -276,6 +286,9 @@ def visualize():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/<path:path>')
+def static_files(path):
+    return send_from_directory(GUI_DIR, path)
 
 if __name__ == '__main__':
     is_debug = os.environ.get('DEBUG', 'false').lower() == 'true'
