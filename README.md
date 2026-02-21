@@ -10,8 +10,11 @@ A high-performance, hardened, and multiplatform-safe OpenCL audio processing eng
   - **Low-pass Filter**: Smoothed 3-tap FIR filter utilizing `__local` memory caching.
   - **Bitcrush**: Pre-computed bit-depth reduction for a classic "lo-fi" sound.
 - **Hardware-Accelerated**: Full OpenCL 3.0 backend with `float4` vectorization.
-- **Hardened Host Code**: Robust error handling, resource management, and WAV validation.
-- **Multiplatform Safe**: Dynamically queries hardware limits at runtime to ensure compatibility across different GPUs and CPUs.
+- **Multiplatform Safe**: Dynamically queries hardware limits at runtime to ensure compatibility across different GPUs and CPUs (supports Windows, Linux, and Raspberry Pi 5).
+- **Hardened Security**:
+  - **Path Jailing**: Prevents directory traversal attacks via `os.path.realpath` containment.
+  - **Type Safety**: Strictly validates all numeric parameters as floats in both frontend and backend.
+  - **Execution Timeouts**: Proactive subprocess monitoring (120s limit) to prevent server hangs.
 
 ## 🛠️ Performance Optimizations
 
@@ -90,6 +93,30 @@ For detailed analysis, use the provided `visualize.py` script. It generates a hi
 python visualize.py output.wav
 ```
 
+## 🖥️ Graphical Dashboard (GUI)
+
+CLFX includes a professional-grade web dashboard for building effect chains visually. It features a modern dark-mode interface with glassmorphism, real-time parameter sliders, and automated waveform analysis.
+
+### To Launch:
+1. Ensure you have **Flask** installed:
+   ```bash
+   pip install flask
+   ```
+2. Navigate to the GUI directory and start the server:
+   ```bash
+   cd gui
+   python server.py
+   ```
+3. Open your browser to `http://localhost:5000`.
+
+### Features:
+- **Drag-and-Drop FX Rack**: Reorder your signal chain visually to control the processing path instantly.
+- **Hardware Status Bar**: Real-time display of the host OS and active OpenCL device (GPU/CPU) via automated system probing (`--info` flag).
+- **Secure Upload Zone**: Drag-and-drop WAV uploads with automated collision-resistant naming (UUID) and a 100MB safety limit.
+- **Accessibility & Offline Ready**: WCAG-compliant ARIA labels and semantic structure. Zero network dependencies (uses high-performance system fonts).
+- **Visual Feedback**: Processed audio waveforms are automatically rendered for peak-amplitude analysis.
+- **Dynamic Controls**: Every effect parameter can be adjusted via high-fidelity, type-safe sliders.
+
 | Effect | Parameter 1 | Parameter 2 | Example |
 | :--- | :--- | :--- | :--- |
 | `gain` | Multiplier | - | `gain 1.5` |
@@ -101,13 +128,33 @@ python visualize.py output.wav
 | `pingpong`| Delay (samples) | Decay (0.0 - 1.0) | `pingpong 8820 0.5` |
 | `chorus`  | - | - | `chorus` |
 | `autowah` | - | - | `autowah` |
+| `distortion`| Drive (>1.0) | - | `distortion 5.0` |
+| `ringmod` | Carrier Freq (Hz)| - | `ringmod 440` |
+| `pitch`   | Ratio (0.5 - 2.0)| - | `pitch 1.5` |
+| `gate`    | Threshold (0.0 - 1.0)| Reduction (0.0 - 1.0) | `gate 0.1 0.0` |
+| `pan`     | L/R Balance (-1 to 1)| - | `pan -0.5` |
+| `eq`      | Center (0.0 - 1.0) | Gain | `eq 0.5 2.0` |
+| `freeze`  | - | - | `freeze` |
+| `convolve`| IR WAV Path | - | `convolve ir.wav` |
+| `phase`   | Depth (0.0 - 1.0) | Rate (0.0 - 1.0) | `phase 0.5 0.2` |
+| `compress`| Threshold (0.0 - 1.0)| Ratio (1 - 20) | `compress 0.5 4` |
 
-## 🛡️ Hardening & Safety
-
-- **Resource Safety**: Uses a `goto cleanup` pattern in `main.c` to guarantee that all OpenCL objects and file handles are released even on error.
-- **Validation**: Validates WAV headers and audio formats before processing.
-- **Probe Logic**: Includes `#ifndef TILE_SIZE` fallbacks in `kernel.cl` for safe initial hardware-probing builds.
 - **Mapping Safety**: Implements explicit `clEnqueueUnmapMemObject` for consistent command queue synchronization.
+
+## 🔬 Implementation Details
+
+### Autowah (Modulated Filter)
+The `autowah` effect uses a modulated 3-tap FIR filter approximation. It shifts between lowpass and highpass characteristics using an internal 0.6Hz LFO to create the sweep. High performance is maintained via `__local` memory caching.
+
+### Advanced Spectral Processing
+CLFX now supports frequency-domain processing through a self-contained **Radix-2 FFT/IFFT** implementation in the OpenCL kernel.
+- **FFT Size**: Optimized for 1024-point blocks.
+- **Spectral EQ**: Direct manipulation of frequency bins.
+- **Spectral Freeze**: Transient smearing achieved through phase randomization.
+- **Convolution**: Frequency-domain pointwise multiplication (efficiently handles 1024-sample blocks).
+
+> [!TIP]
+> Spectral effects force a `local_size` of 256 in `main.c` to guarantee full coverage of the 1024-point FFT window (256 work-items * 4 samples per item), ensuring maximum hardware utilization on modern GPUs.
 
 ---
 Developed for high-performance audio experimentation.

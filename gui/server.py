@@ -1,0 +1,188 @@
+import os
+import subprocess
+import uuid
+import time
+import platform as pf
+from flask import Flask, request, send_from_directory, jsonify
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB Limit
+
+# Base path for the clfx engine - use absolute script directory
+GUI_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.realpath(os.path.join(GUI_DIR, '..'))
+ENGINE_PATH = os.path.join(ROOT_DIR, 'clfx.exe')
+OUTPUT_DIR = os.path.join(GUI_DIR, 'output')
+UPLOADS_DIR = os.path.join(GUI_DIR, 'uploads')
+
+VALID_EFFECTS = {'gain', 'echo', 'lowpass', 'bitcrush', 'tremolo', 'widening',
+                 'pingpong', 'chorus', 'autowah', 'distortion', 'ringmod',
+                 'pitch', 'gate', 'pan', 'eq', 'freeze', 'convolve', 'compress',
+                 'reverb', 'flange', 'phase', 'lowpass'}
+
+for d in [OUTPUT_DIR, UPLOADS_DIR]:
+    if not os.path.exists(d):
+        os.makedirs(d)
+
+def sanitize_path(path, base_dir):
+    """Ensure path is within base_dir and normalized."""
+    if not path:
+        return None
+    # Join and resolve
+    full_path = os.path.realpath(os.path.join(base_dir, path))
+    # Check if full_path starts with base_dir (jail check)
+    if not full_path.startswith(os.path.realpath(base_dir)):
+        return None
+    return full_path
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({"success": False, "error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "No selected file"}), 400
+    
+    if file and file.filename.lower().endswith('.wav'):
+        # Add random prefix to prevent collisions
+        safe_filename = f"{uuid.uuid4().hex[:8]}_{os.path.basename(file.filename)}"
+        save_path = os.path.join(UPLOADS_DIR, safe_filename)
+        file.save(save_path)
+        return jsonify({"success": True, "filename": safe_filename})
+    
+    return jsonify({"success": False, "error": "Only WAV files allowed"}), 400
+
+@app.route('/')
+def index():
+    return send_from_directory(GUI_DIR, 'index.html')
+
+@app.route('/<path:path>')
+def static_files(path):
+    return send_from_directory(GUI_DIR, path)
+
+@app.route('/system-info', methods=['GET'])
+def get_system_info():
+    info = {
+        "os": f"{pf.system()} {pf.release()}",
+        "architecture": pf.machine(),
+        "engine": "Unknown"
+    }
+    
+    try:
+        # Run engine with --info
+        result = subprocess.run([ENGINE_PATH, '--info'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            # Parse engine output for relevant lines
+            lines = result.stdout.split('\n')
+            engine_details = []
+            for line in lines:
+                if line.startswith('Platform') or line.strip().startswith('Device'):
+                    engine_details.append(line.strip())
+            if engine_details:
+                info["engine"] = engine_details
+    except Exception as e:
+        info["engine"] = f"Probe failed: {str(e)}"
+        
+    return jsonify(info)
+
+@app.route('/process', methods=['POST'])
+def process():
+    data = request.json
+    input_file_raw = data.get('inputFile')
+    effects = data.get('effects', [])
+    output_name_raw = data.get('outputName', 'processed.wav')
+    
+    try:
+        global_mix = float(data.get('mix', 1.0))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid mix value"}), 400
+
+    # 1. Sanitize Paths - Prioritize UPLOADS_DIR
+    full_input_path = sanitize_path(input_file_raw, UPLOADS_DIR)
+    if not full_input_path or not os.path.exists(full_input_path):
+        full_input_path = sanitize_path(input_file_raw, ROOT_DIR)
+    
+    if not full_input_path or not os.path.exists(full_input_path):
+        return jsonify({"error": f"Input file not found: {input_file_raw}"}), 400
+
+    # Ensure output name is just a filename, or sanitize it within OUTPUT_DIR
+    output_filename = os.path.basename(output_name_raw)
+    if not output_filename.endswith('.wav'):
+        output_filename += '.wav'
+    full_output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+    # 2. Build Command Line
+    cmd = [ENGINE_PATH, full_input_path, full_output_path]
+
+    for fx in effects:
+        fx_type = fx.get('type')
+        if not fx_type: continue
+        
+        # Whitelist validation
+        if fx_type not in VALID_EFFECTS:
+            return jsonify({"error": f"Unknown or restricted effect: {fx_type}"}), 400
+        
+        cmd.append(fx_type)
+        
+        if fx_type == 'convolve':
+            ir_raw = fx.get('ir')
+            # IR files can be in ROOT_DIR
+            full_ir_path = sanitize_path(ir_raw, ROOT_DIR)
+            if not full_ir_path:
+                return jsonify({"error": f"Invalid IR path: {ir_raw}"}), 400
+            cmd.append(full_ir_path)
+        else:
+            try:
+                if 'p1' in fx: cmd.append(str(float(fx['p1'])))
+                if 'p2' in fx: cmd.append(str(float(fx['p2'])))
+            except (ValueError, TypeError):
+                return jsonify({"error": f"Invalid numeric parameter in {fx_type}"}), 400
+
+    cmd.extend(['--mix', str(global_mix)])
+
+    try:
+        print(f"Executing: {' '.join(cmd)}")
+        # Run engine from project root with timeout to prevent hanging
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT_DIR, timeout=120)
+        
+        if result.returncode == 0:
+            # Generate visualization
+            # visualize.py is in root, needs path to output relative to root
+            rel_output_path = os.path.relpath(full_output_path, ROOT_DIR)
+            viz_cmd = ['python', 'visualize.py', rel_output_path]
+            try:
+                viz_result = subprocess.run(viz_cmd, capture_output=True, text=True, cwd=ROOT_DIR, timeout=30)
+                if viz_result.returncode != 0:
+                    print(f"Visualization failed: {viz_result.stderr}")
+            except subprocess.TimeoutExpired:
+                print("Visualization timed out")
+
+            # Move waveform.png to output if it's in the root
+            root_waveform = os.path.join(ROOT_DIR, 'waveform.png')
+            if os.path.exists(root_waveform):
+                target_waveform = os.path.join(OUTPUT_DIR, 'waveform.png')
+                if os.path.exists(target_waveform):
+                    os.remove(target_waveform)
+                os.rename(root_waveform, target_waveform)
+
+            return jsonify({
+                "success": True, 
+                "output": output_filename,
+                "waveform": "output/waveform.png",
+                "audio": f"output/{output_filename}",
+                "stdout": result.stdout
+            })
+        else:
+            return jsonify({
+                "success": False, 
+                "error": result.stderr or result.stdout
+            }), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "error": "Processing timed out after 120 seconds"}), 504
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+if __name__ == '__main__':
+    is_debug = os.environ.get('DEBUG', 'false').lower() == 'true'
+    print(f"CLFX Dashboard starting (debug={is_debug}) at http://localhost:5000")
+    app.run(port=5000, debug=is_debug)

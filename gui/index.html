@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLFX | Advanced Audio Engine</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="glow"></div>
+
+    <header>
+        <div class="logo">CLFX<span>Engine</span></div>
+        <div class="status" id="engineStatus">Engine: Ready</div>
+    </header>
+
+    <main>
+        <section id="file-hub">
+            <div class="card glass">
+                <h3><span class="icon">📁</span> File Hub</h3>
+
+                <div id="upload-zone" class="upload-zone">
+                    <input type="file" id="fileInput" accept=".wav" hidden>
+                    <div class="upload-content">
+                        <span class="icon">☁️</span>
+                        <p id="upload-hint">Drag & Drop WAV or Click</p>
+                        <span id="selectedFileName"></span>
+                    </div>
+                </div>
+
+                <div class="input-group" style="margin-top: 1.5rem;">
+                    <label for="outputFile"><span class="icon">💾</span> Output Filename</label>
+                    <input type="text" id="outputFile" placeholder="processed.wav" value="processed.wav">
+                </div>
+                <div class="card glass mix-card">
+                    <div class="card-header">
+                        <h3>MASTER MIX</h3>
+                        <span id="mixVal">1.0</span>
+                    </div>
+                    <label for="masterMix" class="sr-only">Master Dry/Wet Mix</label>
+                    <input type="range" id="masterMix" min="0" max="1" step="0.01" value="1.0">
+                </div>
+                <button id="processBtn" class="primary-btn">GENERATE AUDIO</button>
+            </div>
+        </section>
+
+        <section id="fx-rack">
+            <div class="card glass chain-card">
+                <div class="card-header">
+                    <h3>SIGNAL CHAIN</h3>
+                    <div class="add-fx">
+                        <label for="fxSelect" class="sr-only">Add Effect</label>
+                        <select id="fxSelect">
+                            <option value="">+ Add Effect...</option>
+                            <option value="gain">Gain</option>
+                            <option value="distortion">Distortion</option>
+                            <option value="lowpass">Lowpass</option>
+                            <option value="reverb">Reverb</option>
+                            <option value="echo">Echo</option>
+                            <option value="pitch">Pitch Shift</option>
+                            <option value="flange">Flanger</option>
+                            <option value="phase">Phaser</option>
+                            <option value="compress">Compressor</option>
+                            <option value="convolve">Convolution</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <div id="chain-container">
+                <!-- Effects will be injected here -->
+                <div class="empty-hint">Your chain is empty. Add an effect to start.</div>
+            </div>
+
+            <div id="audio-container" class="card glass audio-preview hidden">
+                <h3>PREVIEW</h3>
+                <audio id="outputAudio" controls aria-label="Processed audio output"></audio>
+            </div>
+
+            <div id="viz-container" class="card glass hidden">
+                <h3><span class="icon">📈</span> Waveform Analysis</h3>
+                <div class="viz-wrapper">
+                    <img id="waveformImg" src="" alt="Audio Waveform">
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast" class="hidden"></div>
+    <div id="loader" class="loader-overlay hidden">
+        <div class="loader"></div>
+    </div>
+
+    <footer class="system-footer glass">
+        <div class="system-status" id="system-status">
+            <span class="status-dot pulse" aria-hidden="true"></span>
+            <span id="os-info">Probing System...</span>
+            <span class="separator">|</span>
+            <span id="engine-info">Engine: Initializing...</span>
+        </div>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

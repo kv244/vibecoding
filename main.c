@@ -85,6 +85,55 @@ void draw_waveform_ascii(const float *data, int numSamples, int width) {
   printf("\n");
 }
 
+#define MAX_EFFECTS 16
+
+typedef struct {
+  int type;
+  float p1;
+  float p2;
+  char *ir_file;
+} EffectConfig;
+
+// Simple Radix-2 FFT for IR preparation
+void host_fft(float *real, float *imag, int n) {
+  for (int i = 0, j = 0; i < n; i++) {
+    if (i < j) {
+      float tr = real[i];
+      real[i] = real[j];
+      real[j] = tr;
+      float ti = imag[i];
+      imag[i] = imag[j];
+      imag[j] = ti;
+    }
+    int m = n >> 1;
+    while (m >= 1 && j >= m) {
+      j -= m;
+      m >>= 1;
+    }
+    j += m;
+  }
+  for (int len = 2; len <= n; len <<= 1) {
+    float ang = -2.0f * 3.14159265f / (float)len;
+    float wlen_r = cosf(ang), wlen_i = sinf(ang);
+    for (int i = 0; i < n; i += len) {
+      float w_r = 1.0f, w_i = 0.0f;
+      for (int j = 0; j < len / 2; j++) {
+        int idxA = i + j, idxB = i + j + len / 2;
+        float u_r = real[idxA], u_i = imag[idxA];
+        float v_r = real[idxB] * w_r - imag[idxB] * w_i;
+        float v_i = real[idxB] * w_i + imag[idxB] * w_r;
+        real[idxA] = u_r + v_r;
+        imag[idxA] = u_i + v_i;
+        real[idxB] = u_r - v_r;
+        imag[idxB] = u_i - v_i;
+        float next_w_r = w_r * wlen_r - w_i * wlen_i;
+        w_i = w_r * wlen_i + w_i * wlen_r;
+        w_r = next_w_r;
+      }
+    }
+  }
+}
+
 char *load_kernel_source(const char *filename) {
   FILE *fp = fopen(filename, "rb");
   if (!fp)
@@ -119,11 +168,25 @@ char *load_kernel_source(const char *filename) {
   return source;
 }
 
-int main(int argc, char **argv) {
+int is_effect_name(const char *name) {
+  const char *effects[] = {
+      "gain",     "echo",   "lowpass", "bitcrush",   "tremolo",  "widening",
+      "pingpong", "chorus", "autowah", "distortion", "ringmod",  "pitch",
+      "gate",     "pan",    "eq",      "freeze",     "convolve", "compress",
+      "reverb",   "flange", "phase",   "--mix"};
+  int num_effects_list = sizeof(effects) / sizeof(effects[0]);
+  for (int i = 0; i < num_effects_list; i++) {
+    if (strcmp(name, effects[i]) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+int main(int argc, char *argv[]) {
   int ret = 0;
   FILE *fp = NULL, *out_fp = NULL;
   int16_t *raw_data = NULL;
-  float *h_input = NULL, *h_output = NULL;
+  float *h_input = NULL, *h_output = NULL, *h_ir = NULL;
   char *source = NULL;
 
   cl_platform_id platform = NULL;
@@ -132,7 +195,8 @@ int main(int argc, char **argv) {
   cl_command_queue queue = NULL;
   cl_program program = NULL;
   cl_kernel kernel = NULL;
-  cl_mem d_in = NULL, d_out = NULL;
+  cl_mem d_in = NULL, d_out = NULL, d_ir = NULL, d_ir_dummy = NULL;
+  cl_mem d_initial_in = NULL, d_initial_out = NULL;
   cl_int err;
 
   if (argc < 4) {
@@ -147,15 +211,83 @@ int main(int argc, char **argv) {
     printf("  widening <width>        (e.g., widening 1.5) [Stereo Only]\n");
     printf("  pingpong <delay> <decay>(e.g., pingpong 8820 0.5)\n");
     printf("  chorus                  (preset sweep)\n");
-    printf("  autowah                 (preset sweep)\n");
+    printf("  autowah <depth> <rate>       Autowah (depth 0-1, rate 0-1)\n");
     printf("  distortion <drive>      (e.g., distortion 5.0)\n");
     printf("  ringmod <freq>          (e.g., ringmod 440)\n");
     printf("  pitch <ratio>           (e.g., pitch 1.5)\n");
     printf("  gate <threshold> <red>  (e.g., gate 0.1 0.0)\n");
     printf("  pan <value>             (e.g., pan -0.5 [L..R])\n");
+    printf(
+        "  eq <center_f> <gain>         Spectral EQ (center 0-1, gain 0-10)\n");
+    printf("  freeze <amount> <random>     Spectral Freeze (amount 0-1, random "
+           "0-1)\n");
+    printf("  convolve <ir_file>           Convolution Reverb (requires WAV IR "
+           "file)\n");
+    printf("  compress <threshold> <ratio> Dynamics Compressor (thresh 0-1, "
+           "ratio 1-20)\n");
+    printf("  reverb <size> <dry/wet>      Algorithmic Reverb (size 0-1, mix "
+           "0-1)\n");
+    printf("  flange <depth> <feedback>    Flanger effect\n");
+    printf("  phase <depth> <rate>         Phaser effect\n");
     printf("\nOptions:\n");
     printf("  --visualize             Display ASCII waveform\n");
+    printf("  --info                  Print system and OpenCL information\n");
     return 1;
+  }
+
+  // Handle --info early
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--info") == 0) {
+      printf("OS: ");
+#ifdef _WIN32
+      printf("Windows\n");
+#elif __APPLE__
+      printf("macOS\n");
+#elif __linux__
+      printf("Linux\n");
+#else
+      printf("Unknown\n");
+#endif
+
+      cl_uint n_platforms;
+      if (clGetPlatformIDs(0, NULL, &n_platforms) == CL_SUCCESS &&
+          n_platforms > 0) {
+        cl_platform_id *plat_list =
+            malloc(sizeof(cl_platform_id) * n_platforms);
+        clGetPlatformIDs(n_platforms, plat_list, NULL);
+        for (cl_uint p = 0; p < n_platforms; p++) {
+          char p_name[128], p_vendor[128], p_ver[128];
+          clGetPlatformInfo(plat_list[p], CL_PLATFORM_NAME, sizeof(p_name),
+                            p_name, NULL);
+          clGetPlatformInfo(plat_list[p], CL_PLATFORM_VENDOR, sizeof(p_vendor),
+                            p_vendor, NULL);
+          clGetPlatformInfo(plat_list[p], CL_PLATFORM_VERSION, sizeof(p_ver),
+                            p_ver, NULL);
+          printf("Platform[%u]: %s (%s) %s\n", p, p_name, p_vendor, p_ver);
+
+          cl_uint n_devices;
+          if (clGetDeviceIDs(plat_list[p], CL_DEVICE_TYPE_ALL, 0, NULL,
+                             &n_devices) == CL_SUCCESS) {
+            cl_device_id *dev_list = malloc(sizeof(cl_device_id) * n_devices);
+            clGetDeviceIDs(plat_list[p], CL_DEVICE_TYPE_ALL, n_devices,
+                           dev_list, NULL);
+            for (cl_uint d = 0; d < n_devices; d++) {
+              char d_name[128], d_ver[128];
+              clGetDeviceInfo(dev_list[d], CL_DEVICE_NAME, sizeof(d_name),
+                              d_name, NULL);
+              clGetDeviceInfo(dev_list[d], CL_DEVICE_VERSION, sizeof(d_ver),
+                              d_ver, NULL);
+              printf("  Device[%u]: %s [%s]\n", d, d_name, d_ver);
+            }
+            free(dev_list);
+          }
+        }
+        free(plat_list);
+      } else {
+        printf("OpenCL: No platforms found or Error.\n");
+      }
+      return 0;
+    }
   }
 
   int do_visualize = 0;
@@ -166,57 +298,208 @@ int main(int argc, char **argv) {
     }
   }
 
-  int effect_type = 0;
-  float param1 = 0.0f;
-  float param2 = 0.0f;
+  EffectConfig chain[MAX_EFFECTS];
+  int num_effects = 0;
+  float global_mix = 1.0f;
 
-  if (strcmp(argv[3], "gain") == 0) {
-    effect_type = 0;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 1.0f;
-  } else if (strcmp(argv[3], "echo") == 0) {
-    effect_type = 1;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 4410.0f;
-    param2 = (argc > 5) ? (float)atof(argv[5]) : 0.5f;
-  } else if (strcmp(argv[3], "lowpass") == 0) {
-    effect_type = 2;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 0.5f;
-  } else if (strcmp(argv[3], "bitcrush") == 0) {
-    effect_type = 3;
-    float bits = (argc > 4) ? (float)atof(argv[4]) : 8.0f;
-    param1 = powf(2.0f, roundf(bits));
-  } else if (strcmp(argv[3], "tremolo") == 0) {
-    effect_type = 4;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 5.0f;
-    param2 = (argc > 5) ? (float)atof(argv[5]) : 0.5f;
-  } else if (strcmp(argv[3], "widening") == 0) {
-    effect_type = 5;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 1.5f;
-  } else if (strcmp(argv[3], "pingpong") == 0) {
-    effect_type = 6;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 8820.0f;
-    param2 = (argc > 5) ? (float)atof(argv[5]) : 0.5f;
-  } else if (strcmp(argv[3], "chorus") == 0) {
-    effect_type = 7;
-  } else if (strcmp(argv[3], "autowah") == 0) {
-    effect_type = 8;
-  } else if (strcmp(argv[3], "distortion") == 0) {
-    effect_type = 9;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 2.0f; // Drive
-  } else if (strcmp(argv[3], "ringmod") == 0) {
-    effect_type = 10;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 440.0f; // Freq
-  } else if (strcmp(argv[3], "pitch") == 0) {
-    effect_type = 11;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 1.5f; // Ratio
-  } else if (strcmp(argv[3], "gate") == 0) {
-    effect_type = 12;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 0.1f; // Threshold
-    param2 = (argc > 5) ? (float)atof(argv[5]) : 0.0f; // Reduction
-  } else if (strcmp(argv[3], "pan") == 0) {
-    effect_type = 13;
-    param1 = (argc > 4) ? (float)atof(argv[4]) : 0.0f; // Pan [-1, 1]
-  } else {
-    printf("Unknown effect: %s\n", argv[3]);
+  int arg_idx = 3;
+  while (arg_idx < argc && num_effects < MAX_EFFECTS) {
+    if (strcmp(argv[arg_idx], "--mix") == 0) {
+      if (arg_idx + 1 < argc) {
+        global_mix = atof(argv[++arg_idx]);
+      }
+      arg_idx++;
+      continue;
+    }
+    if (strcmp(argv[arg_idx], "--visualize") == 0) {
+      arg_idx++;
+      continue;
+    }
+
+    const char *effect_name = argv[arg_idx];
+    EffectConfig *cfg = &chain[num_effects];
+    cfg->type = -1;
+    cfg->p1 = 0.0f;
+    cfg->p2 = 0.0f;
+    cfg->ir_file = NULL;
+
+    if (strcmp(effect_name, "gain") == 0) {
+      cfg->type = 0;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 1.0f;
+    } else if (strcmp(effect_name, "echo") == 0) {
+      cfg->type = 1;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 4410.0f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.5f;
+    } else if (strcmp(effect_name, "lowpass") == 0) {
+      cfg->type = 2;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.5f;
+    } else if (strcmp(effect_name, "bitcrush") == 0) {
+      cfg->type = 3;
+      float bits = 8.0f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        bits = atof(argv[++arg_idx]);
+      cfg->p1 = powf(2.0f, roundf(bits));
+    } else if (strcmp(effect_name, "tremolo") == 0) {
+      cfg->type = 4;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 5.0f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.5f;
+    } else if (strcmp(effect_name, "widening") == 0) {
+      cfg->type = 5;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 1.5f;
+    } else if (strcmp(effect_name, "pingpong") == 0) {
+      cfg->type = 6;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 8820.0f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.5f;
+    } else if (strcmp(effect_name, "chorus") == 0) {
+      cfg->type = 7;
+    } else if (strcmp(effect_name, "autowah") == 0) {
+      cfg->type = 8;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.5f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.2f;
+    } else if (strcmp(effect_name, "distortion") == 0) {
+      cfg->type = 9;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 2.0f;
+    } else if (strcmp(effect_name, "ringmod") == 0) {
+      cfg->type = 10;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 440.0f;
+    } else if (strcmp(effect_name, "pitch") == 0) {
+      cfg->type = 11;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 1.5f;
+    } else if (strcmp(effect_name, "gate") == 0) {
+      cfg->type = 12;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.1f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.0f;
+    } else if (strcmp(effect_name, "pan") == 0) {
+      cfg->type = 13;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.0f;
+    } else if (strcmp(effect_name, "eq") == 0) {
+      cfg->type = 14;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.5f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 1.0f;
+    } else if (strcmp(effect_name, "freeze") == 0) {
+      cfg->type = 15;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.5f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.0f;
+    } else if (strcmp(effect_name, "convolve") == 0) {
+      cfg->type = 16;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->ir_file = argv[++arg_idx];
+    } else if (strcmp(effect_name, "compress") == 0) {
+      cfg->type = 17;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.5f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 4.0f;
+    } else if (strcmp(effect_name, "reverb") == 0) {
+      cfg->type = 18;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.6f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.5f;
+    } else if (strcmp(effect_name, "flange") == 0) {
+      cfg->type = 19;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.5f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.7f;
+    } else if (strcmp(effect_name, "phase") == 0) {
+      cfg->type = 20;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p1 = atof(argv[++arg_idx]);
+      else
+        cfg->p1 = 0.5f;
+      if (arg_idx + 1 < argc && !is_effect_name(argv[arg_idx + 1]))
+        cfg->p2 = atof(argv[++arg_idx]);
+      else
+        cfg->p2 = 0.2f;
+    } else {
+      fprintf(stderr, "Error: Unknown effect '%s' in chain.\n", effect_name);
+      return 1;
+    }
+
+    if (cfg->type != -1) {
+      num_effects++;
+    }
+    arg_idx++;
+  }
+
+  if (num_effects == 0) {
+    printf("No valid effects found in chain.\n");
     return 1;
   }
 
@@ -276,7 +559,18 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
   cl_platform_id *platforms = malloc(sizeof(cl_platform_id) * num_platforms);
-  clGetPlatformIDs(num_platforms, platforms, NULL);
+  if (!platforms) {
+    fprintf(stderr, "Failed to allocate platforms array.\n");
+    ret = 1;
+    goto cleanup;
+  }
+  err = clGetPlatformIDs(num_platforms, platforms, NULL);
+  if (err != CL_SUCCESS) {
+    fprintf(stderr, "clGetPlatformIDs failed.\n");
+    free(platforms);
+    ret = 1;
+    goto cleanup;
+  }
 
   int found_device = 0;
   // 1. Search for a GPU on any platform
@@ -340,46 +634,33 @@ int main(int argc, char **argv) {
   free(source);
   source = NULL;
 
-  // Initial build to query kernel info
-  err = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+  // Pre-bake TILE_SIZE if any spectral effect is in the chain
+  size_t local_block_size = 64;
+  for (int i = 0; i < num_effects; i++) {
+    if (chain[i].type >= 14) { // Spectral effects start from type 14 (EQ)
+      local_block_size = 256;
+      break;
+    }
+  }
+
+  char build_options[256];
+  sprintf(build_options, "-DTILE_SIZE=%zu", local_block_size);
+  err = clBuildProgram(program, 1, &device, build_options, NULL, NULL);
   if (err != CL_SUCCESS) {
-    char build_log[8192];
-    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG,
-                          sizeof(build_log), build_log, NULL);
-    fprintf(stderr, "Initial Build Error:\n%s\n", build_log);
+    size_t log_size;
+    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL,
+                          &log_size);
+    char *log = (char *)malloc(log_size);
+    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log,
+                          NULL);
+    fprintf(stderr, "clBuildProgram failed: %s\n", log);
+    free(log);
     ret = 1;
     goto cleanup;
   }
 
   kernel = clCreateKernel(program, "apply_effects", &err);
   checkErr(err, "clCreateKernel");
-
-  size_t preferred_wg, kernel_max_wg;
-  clGetKernelWorkGroupInfo(kernel, device,
-                           CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
-                           sizeof(preferred_wg), &preferred_wg, NULL);
-  clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE,
-                           sizeof(kernel_max_wg), &kernel_max_wg, NULL);
-
-  // Determine optimal and safe local_size
-  size_t local_block_size = preferred_wg;
-  if (local_block_size > kernel_max_wg)
-    local_block_size = kernel_max_wg;
-  if (local_block_size > 256)
-    local_block_size = 256; // Cap for local memory tile size safety
-
-  printf("Preferred WG: %zu, Kernel Max WG: %zu, Chosen WG: %zu\n",
-         preferred_wg, kernel_max_wg, local_block_size);
-
-  // Rebuild with TILE_SIZE macro for robustness
-  char build_options[64];
-  sprintf(build_options, "-DTILE_SIZE=%zu", local_block_size);
-  clReleaseKernel(kernel);
-  err = clBuildProgram(program, 1, &device, build_options, NULL, NULL);
-  checkErr(err, "clBuildProgram (optimized)");
-
-  kernel = clCreateKernel(program, "apply_effects", &err);
-  checkErr(err, "clCreateKernel (optimized)");
 
   // Padding: Align numSamples to local_size * 4 (for float4 vectorization)
   int samplesPerWorkItem = 4;
@@ -400,54 +681,224 @@ int main(int argc, char **argv) {
   for (int i = 0; i < numSamples; i++)
     h_input[i] = raw_data[i] / 32768.0f;
 
-  cl_mem_flags in_flags = unified ? (CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR)
-                                  : (CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR);
-  cl_mem_flags out_flags =
-      unified ? (CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR) : CL_MEM_WRITE_ONLY;
+  // Create ping-pong buffers
+  cl_mem_flags in_out_flags = unified
+                                  ? (CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR)
+                                  : (CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR);
+  cl_mem_flags out_only_flags =
+      unified ? (CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR) : CL_MEM_READ_WRITE;
 
-  d_in = clCreateBuffer(context, in_flags, sizeof(float) * paddedSamples,
+  d_in = clCreateBuffer(context, in_out_flags, sizeof(float) * paddedSamples,
                         h_input, &err);
-  checkErr(err, "clCreateBuffer (d_in)");
-  d_out = clCreateBuffer(context, out_flags, sizeof(float) * paddedSamples,
+  d_out = clCreateBuffer(context, out_only_flags, sizeof(float) * paddedSamples,
                          (unified ? h_output : NULL), &err);
-  checkErr(err, "clCreateBuffer (d_out)");
+  d_initial_in = d_in;
+  d_initial_out = d_out;
+  checkErr(err, "clCreateBuffer (d_in/d_out)");
 
-  err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in);
-  checkErr(err, "clSetKernelArg (d_in)");
-  err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out);
-  checkErr(err, "clSetKernelArg (d_out)");
-  err = clSetKernelArg(kernel, 2, sizeof(int), &effect_type);
-  checkErr(err, "clSetKernelArg (effect_type)");
-  err = clSetKernelArg(kernel, 3, sizeof(float), &param1);
-  checkErr(err, "clSetKernelArg (param1)");
-  err = clSetKernelArg(kernel, 4, sizeof(float), &param2);
-  checkErr(err, "clSetKernelArg (param2)");
-  err = clSetKernelArg(kernel, 5, sizeof(int), &numSamples);
-  checkErr(err, "clSetKernelArg (numSamples)");
-  float fs = (float)header.sampleRate;
-  err = clSetKernelArg(kernel, 6, sizeof(float), &fs);
-  checkErr(err, "clSetKernelArg (sampleRate)");
+  err = clGetKernelWorkGroupInfo(kernel, device,
+                                 CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                                 sizeof(size_t), &local_block_size, NULL);
+  if (err != CL_SUCCESS)
+    local_block_size = 64;
+  printf("Device preferred workgroup size: %zu\n", local_block_size);
+
+  int samplesTotal = (int)paddedSamples;
+  float sRate = (float)header.sampleRate;
   int numChans = (int)header.numChannels;
-  err = clSetKernelArg(kernel, 7, sizeof(int), &numChans);
-  checkErr(err, "clSetKernelArg (numChannels)");
+
+  // Load IR file if any effect requires it
+  // This assumes only one IR file can be used across the chain for simplicity
+  // If multiple convolve effects with different IRs were needed, this logic
+  // would need to be more complex
+  char *ir_filename = NULL;
+  for (int i = 0; i < num_effects; i++) {
+    if (chain[i].type == 16 && chain[i].ir_file) {
+      ir_filename = chain[i].ir_file;
+      break;
+    }
+  }
+
+  if (ir_filename) {
+    char cache_name[256];
+    snprintf(cache_name, 256, "%s.clir", ir_filename);
+
+    int cache_loaded = 0;
+    FILE *fcache = fopen(cache_name, "rb");
+    if (fcache) {
+      h_ir = (float *)port_aligned_alloc(sizeof(float) * 2048, 4096);
+      if (h_ir && fread(h_ir, sizeof(float), 2048, fcache) == 2048) {
+        printf("Loaded IR from cache: %s\n", cache_name);
+        cache_loaded = 1;
+      } else {
+        if (h_ir)
+          port_aligned_free(h_ir);
+        h_ir = NULL;
+      }
+      fclose(fcache);
+    }
+
+    if (!cache_loaded) {
+      FILE *fir = fopen(ir_filename, "rb");
+      if (fir) {
+        WavHeader ir_h;
+        if (fread(&ir_h, sizeof(WavHeader), 1, fir) != 1) {
+          fprintf(stderr, "Failed to read IR header from %s\n", ir_filename);
+          fclose(fir);
+          ret = 1;
+          goto cleanup;
+        }
+        int ir_samples = (ir_h.subchunk2Size / sizeof(int16_t));
+        if (ir_samples <= 0) {
+          fprintf(stderr, "IR file contains no samples\n");
+          fclose(fir);
+          ret = 1;
+          goto cleanup;
+        }
+        ir_samples = ir_samples > 1024
+                         ? 1024
+                         : ir_samples; // Cap for this simplified version
+
+        int16_t *ir_raw = malloc(ir_samples * sizeof(int16_t));
+        if (!ir_raw) {
+          perror("Failed to allocate ir_raw");
+          fclose(fir);
+          ret = 1;
+          goto cleanup;
+        }
+        if (fread(ir_raw, sizeof(int16_t), ir_samples, fir) != ir_samples) {
+          fprintf(stderr, "Failed to read IR audio data\n");
+          free(ir_raw);
+          fclose(fir);
+          ret = 1;
+          goto cleanup;
+        }
+        fclose(fir);
+
+        h_ir = (float *)port_aligned_alloc(sizeof(float) * 2048, 4096);
+        if (!h_ir) {
+          perror("Failed to allocate h_ir for FFT");
+          free(ir_raw);
+          ret = 1;
+          goto cleanup;
+        }
+        float *real = (float *)malloc(sizeof(float) * 1024);
+        float *imag = (float *)malloc(sizeof(float) * 1024);
+        if (!real || !imag) {
+          perror("Failed to allocate real/imag for FFT");
+          free(ir_raw);
+          free(real);
+          free(imag);
+          port_aligned_free(h_ir);
+          h_ir = NULL;
+          ret = 1;
+          goto cleanup;
+        }
+
+        for (int i = 0; i < 1024; i++) {
+          real[i] = (i < ir_samples) ? (ir_raw[i] / 32768.0f) : 0.0f;
+          imag[i] = 0.0f;
+        }
+        host_fft(real, imag, 1024);
+        for (int i = 0; i < 1024; i++) {
+          h_ir[i * 2] = real[i];
+          h_ir[i * 2 + 1] = imag[i];
+        }
+        free(real);
+        free(imag);
+        free(ir_raw);
+
+        fcache = fopen(cache_name, "wb");
+        if (fcache) {
+          fwrite(h_ir, sizeof(float), 2048, fcache);
+          fclose(fcache);
+          printf("Saved IR cache: %s\n", cache_name);
+        }
+        cache_loaded = 1;
+      } else {
+        perror("Failed to open IR file for processing");
+        ret = 1;
+        goto cleanup;
+      }
+    }
+
+    if (cache_loaded) {
+      d_ir = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                            sizeof(float) * 2048, h_ir, &err);
+      checkErr(err, "clCreateBuffer (d_ir)");
+    }
+    if (d_ir == NULL) {
+      float zero = 0.0f;
+      d_ir_dummy =
+          clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                         sizeof(float), &zero, &err);
+      checkErr(err, "clCreateBuffer (d_ir_dummy)");
+      err = clSetKernelArg(kernel, 8, sizeof(cl_mem), &d_ir_dummy);
+    } else {
+      err = clSetKernelArg(kernel, 8, sizeof(cl_mem), &d_ir);
+    }
+    checkErr(err, "clSetKernelArg (d_ir)");
+  } else {
+    // If no convolve effect, still need to set arg 8 to SOMETHING
+    float zero = 0.0f;
+    d_ir_dummy =
+        clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                       sizeof(float), &zero, &err);
+    checkErr(err, "clCreateBuffer (d_ir_dummy)");
+    err = clSetKernelArg(kernel, 8, sizeof(cl_mem), &d_ir_dummy);
+    checkErr(err, "clSetKernelArg (d_ir_dummy fallback)");
+  }
 
   size_t global_size = paddedSamples / 4;
-  err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size,
-                               &local_block_size, 0, NULL, NULL);
-  checkErr(err, "clEnqueueNDRangeKernel");
+  err = clSetKernelArg(kernel, 5, sizeof(int), &samplesTotal);
+  err |= clSetKernelArg(kernel, 6, sizeof(float), &sRate);
+  err |= clSetKernelArg(kernel, 7, sizeof(int), &numChans);
+  err |= clSetKernelArg(kernel, 9, sizeof(float), &global_mix);
+  checkErr(err, "clSetKernelArg (common)");
 
+  // --- 2. Processing Loop for Chaining ---
+  for (int i = 0; i < num_effects; i++) {
+    err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in);
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out);
+    err |= clSetKernelArg(kernel, 2, sizeof(int), &chain[i].type);
+    err |= clSetKernelArg(kernel, 3, sizeof(float), &chain[i].p1);
+    err |= clSetKernelArg(kernel, 4, sizeof(float), &chain[i].p2);
+    checkErr(err, "clSetKernelArg (loop)");
+
+    size_t current_global = global_size;
+    if (chain[i].type >= 14) {
+      current_global = ((current_global + 255) / 256) * 256;
+    }
+
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &current_global,
+                                 &local_block_size, 0, NULL, NULL);
+    checkErr(err, "clEnqueueNDRangeKernel");
+
+    // Ping-pong swap
+    cl_mem tmp = d_in;
+    d_in = d_out;
+    d_out = tmp;
+  }
+
+  // Final result is in d_in (due to the swap after the last kernel call)
+  // --- 4. Read Result ---
+  // The final result is in d_in due to the swap at the end of the loop
   if (unified) {
-    cl_int map_err;
-    void *mapped_ptr = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0,
-                                          sizeof(float) * paddedSamples, 0,
-                                          NULL, NULL, &map_err);
-    checkErr(map_err, "clEnqueueMapBuffer");
-    clEnqueueUnmapMemObject(queue, d_out, mapped_ptr, 0, NULL, NULL);
+    void *mapped_ptr =
+        clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_READ, 0,
+                           sizeof(float) * numSamples, 0, NULL, NULL, &err);
+    checkErr(err, "clEnqueueMapBuffer (final)");
+    // If d_in is not already using h_output, we must copy.
+    // If it is using it (odd swap), memcpy to self is harmless or we can skip.
+    if (mapped_ptr != h_output) {
+      memcpy(h_output, mapped_ptr, sizeof(float) * numSamples);
+    }
+    clEnqueueUnmapMemObject(queue, d_in, mapped_ptr, 0, NULL, NULL);
   } else {
-    err = clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0,
-                              sizeof(float) * paddedSamples, h_output, 0, NULL,
-                              NULL);
-    checkErr(err, "clEnqueueReadBuffer");
+    err =
+        clEnqueueReadBuffer(queue, d_in, CL_TRUE, 0, sizeof(float) * numSamples,
+                            h_output, 0, NULL, NULL);
+    checkErr(err, "clEnqueueReadBuffer (final)");
   }
 
   // --- 3. Save WAV File ---
@@ -486,10 +937,16 @@ cleanup:
     port_aligned_free(h_input);
   if (h_output)
     port_aligned_free(h_output);
-  if (d_in)
-    clReleaseMemObject(d_in);
-  if (d_out)
-    clReleaseMemObject(d_out);
+  if (h_ir)
+    port_aligned_free(h_ir);
+  if (d_initial_in)
+    clReleaseMemObject(d_initial_in);
+  if (d_initial_out)
+    clReleaseMemObject(d_initial_out);
+  if (d_ir)
+    clReleaseMemObject(d_ir);
+  if (d_ir_dummy)
+    clReleaseMemObject(d_ir_dummy);
   if (kernel)
     clReleaseKernel(kernel);
   if (program)
