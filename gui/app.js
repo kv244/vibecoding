@@ -28,8 +28,6 @@ let draggedIndex = null;
 const chainContainer = document.getElementById('chain-container');
 const fxSelect = document.getElementById('fxSelect');
 const processBtn = document.getElementById('processBtn');
-const masterMix = document.getElementById('masterMix');
-const mixVal = document.getElementById('mixVal');
 const uploadZone = document.getElementById('upload-zone');
 const fileInput = document.getElementById('fileInput');
 const selectedFileName = document.getElementById('selectedFileName');
@@ -277,13 +275,7 @@ async function fetchSystemInfo() {
 
 // --- Interaction ---
 
-masterMix.addEventListener('input', (e) => {
-    mixVal.innerText = e.target.value;
-});
-
 processBtn.addEventListener('click', async () => {
-    const outputName = document.getElementById('outputFile').value;
-
     if (!currentInputFile) {
         showToast("Please upload an input file first");
         return;
@@ -294,32 +286,16 @@ processBtn.addEventListener('click', async () => {
         return;
     }
 
-    if (!outputName || outputName.trim() === "") {
-        showToast("Please specify an output filename");
-        return;
-    }
-
-    if (/[^a-zA-Z0-9._-]/.test(outputName)) {
-        showToast("Output filename contains restricted characters");
-        return;
-    }
-
-    if (!outputName.toLowerCase().endsWith('.wav')) {
-        showToast("Output filename must end with .wav");
-        return;
-    }
-
-    if (!outputName.toLowerCase().endsWith('.wav')) {
-        showToast("Output filename must end with .wav");
-        return;
-    }
+    // Auto-generate output filename
+    const uuid = Math.random().toString(36).substring(2, 8);
+    const outputName = `processed_${uuid}.wav`;
 
     showLoader(true);
 
     const payload = {
         inputFile: currentInputFile,
         outputName,
-        mix: parseFloat(masterMix.value),
+        mix: 1.0,  // Master mix removed from UI
         effects: effectChain.map(fx => ({
             type: fx.type,
             ...fx.params
