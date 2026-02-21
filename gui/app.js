@@ -325,10 +325,11 @@ processBtn.addEventListener('click', async () => {
                 vizContainer.classList.remove('hidden');
             }
         } else {
-            showToast(`Error: ${result.error}`, 5000);
+            const errMsg = result.error || result.stderr || 'Unknown engine error. Is clfx.exe compiled?';
+            showToast(`Error: ${errMsg}`, 6000);
         }
     } catch (e) {
-        showToast(`Server unreachable: ${e.message}`, 5000);
+        showToast(`Server unreachable: ${e.message || 'Check that server.py is running'}`, 5000);
     } finally {
         showLoader(false);
     }
@@ -344,3 +345,6 @@ function showToast(msg, duration = 3000) {
 function showLoader(show) {
     document.getElementById('loader').classList.toggle('hidden', !show);
 }
+
+// --- Startup ---
+fetchSystemInfo();
