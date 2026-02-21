@@ -50,8 +50,25 @@ def upload_file():
         safe_filename = f"{uuid.uuid4().hex[:8]}_{os.path.basename(file.filename)}"
         save_path = os.path.join(UPLOADS_DIR, safe_filename)
         file.save(save_path)
-        return jsonify({"success": True, "filename": safe_filename})
-    
+
+        # Validate WAV is 16-bit PCM (engine requirement)
+        try:
+            import wave
+            with wave.open(save_path, 'rb') as wf:
+                bits = wf.getsampwidth() * 8
+                ch = wf.getnchannels()
+                if bits != 16:
+                    os.remove(save_path)
+                    return jsonify({"success": False,
+                        "error": f"Engine requires 16-bit PCM WAV, but this file is {bits}-bit. "
+                                 f"Convert with: ffmpeg -i input.wav -acodec pcm_s16le -ar 44100 output.wav"}), 400
+        except Exception as e:
+            os.remove(save_path)
+            return jsonify({"success": False, "error": f"Invalid WAV file: {e}"}), 400
+
+        return jsonify({"success": True, "filename": safe_filename,
+                        "info": f"Loaded: {ch}ch 16-bit PCM"})
+
     return jsonify({"success": False, "error": "Only WAV files allowed"}), 400
 
 @app.route('/')
@@ -181,9 +198,15 @@ def process():
                 "stdout": result.stdout
             })
         else:
+            diag = f"Exit code {result.returncode}"
+            if result.stderr.strip(): diag += f" | stderr: {result.stderr.strip()}"
+            if result.stdout.strip(): diag += f" | stdout: {result.stdout.strip()}"
+            if not result.stderr.strip() and not result.stdout.strip():
+                diag += " | No output — engine binary may be missing or not compiled for this platform."
             return jsonify({
-                "success": False, 
-                "error": result.stderr or result.stdout
+                "success": False,
+                "error": diag,
+                "cmd": ' '.join(cmd)
             }), 500
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "error": "Processing timed out after 120 seconds"}), 504
