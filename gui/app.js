@@ -26,6 +26,8 @@ const uploadHint = document.getElementById('upload-hint');
 
 const osInfoSpan = document.getElementById('os-info');
 const engineInfoSpan = document.getElementById('engine-info');
+const engineVerSpan = document.getElementById('engine-ver');
+const guiVerSpan = document.getElementById('gui-ver');
 
 let currentInputFile = null;
 
@@ -221,6 +223,8 @@ async function fetchSystemInfo() {
         const data = await response.json();
 
         osInfoSpan.innerText = data.os;
+        guiVerSpan.innerText = data.gui_version;
+        engineVerSpan.innerText = data.engine_version;
 
         if (Array.isArray(data.engine)) {
             // Find the first device if available

@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define CLFX_VERSION "1.0.1"
+
 static inline void *port_aligned_alloc(size_t size, size_t alignment) {
 #ifdef _WIN32
   return _aligned_malloc(size, alignment);
@@ -183,6 +185,7 @@ int is_effect_name(const char *name) {
 }
 
 int main(int argc, char *argv[]) {
+  printf("--- CLFX Audio Engine v%s ---\n", CLFX_VERSION);
   int ret = 0;
   FILE *fp = NULL, *out_fp = NULL;
   int16_t *raw_data = NULL;
@@ -238,6 +241,7 @@ int main(int argc, char *argv[]) {
   // Handle --info early
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--info") == 0) {
+      printf("CLFX Engine Version: %s\n", CLFX_VERSION);
       printf("OS: ");
 #ifdef _WIN32
       printf("Windows\n");

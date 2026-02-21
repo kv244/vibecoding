@@ -157,4 +157,5 @@ CLFX now supports frequency-domain processing through a self-contained **Radix-2
 > Spectral effects force a `local_size` of 256 in `main.c` to guarantee full coverage of the 1024-point FFT window (256 work-items * 4 samples per item), ensuring maximum hardware utilization on modern GPUs.
 
 ---
+**Last Commit:** 2026-02-21
 Developed for high-performance audio experimentation.

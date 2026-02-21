@@ -10,10 +10,12 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB Limit
 
 # Base path for the clfx engine - use absolute script directory
 GUI_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.realpath(os.path.join(GUI_DIR, '..'))
+ROOT_DIR = os.path.dirname(GUI_DIR)
 ENGINE_PATH = os.path.join(ROOT_DIR, 'clfx.exe')
 OUTPUT_DIR = os.path.join(GUI_DIR, 'output')
 UPLOADS_DIR = os.path.join(GUI_DIR, 'uploads')
+
+GUI_VERSION = "1.0.1"
 
 VALID_EFFECTS = {'gain', 'echo', 'lowpass', 'bitcrush', 'tremolo', 'widening',
                  'pingpong', 'chorus', 'autowah', 'distortion', 'ringmod',
@@ -65,6 +67,8 @@ def get_system_info():
     info = {
         "os": f"{pf.system()} {pf.release()}",
         "architecture": pf.machine(),
+        "gui_version": GUI_VERSION,
+        "engine_version": "Unknown",
         "engine": "Unknown"
     }
     
@@ -76,6 +80,8 @@ def get_system_info():
             lines = result.stdout.split('\n')
             engine_details = []
             for line in lines:
+                if "CLFX Engine Version:" in line:
+                    info["engine_version"] = line.split(":")[1].strip()
                 if line.startswith('Platform') or line.strip().startswith('Device'):
                     engine_details.append(line.strip())
             if engine_details:
