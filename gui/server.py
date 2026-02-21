@@ -62,6 +62,7 @@ def upload_file():
         # Validate WAV is 16-bit PCM (engine requirement)
         # NOTE: all os.remove() calls must happen AFTER the `with` block so
         #       the file handle is closed first (Windows does not allow deleting open files).
+        bits, ch, wav_err = None, None, None
         frames, fs, duration = None, None, None
         try:
             import wave
