@@ -1,14 +1,25 @@
 const fxConfig = {
-    gain: { name: 'Gain', params: [{ id: 'p1', label: 'Multiplier', min: 0, max: 5, step: 0.1, default: 1.0 }] },
-    distortion: { name: 'Distortion', params: [{ id: 'p1', label: 'Drive', min: 1, max: 20, step: 0.5, default: 2.0 }] },
-    lowpass: { name: 'Lowpass', params: [{ id: 'p1', label: 'Strength', min: 0, max: 1, step: 0.05, default: 0.5 }] },
-    reverb: { name: 'Reverb (Alg)', params: [{ id: 'p1', label: 'Size', min: 0, max: 1, step: 0.05, default: 0.6 }, { id: 'p2', label: 'Mix', min: 0, max: 1, step: 0.05, default: 0.5 }] },
-    echo: { name: 'Echo', params: [{ id: 'p1', label: 'Delay (smp)', min: 100, max: 20000, step: 100, default: 4410 }, { id: 'p2', label: 'Decay', min: 0, max: 1, step: 0.05, default: 0.5 }] },
-    pitch: { name: 'Pitch Shift', params: [{ id: 'p1', label: 'Ratio', min: 0.5, max: 2.0, step: 0.05, default: 1.0 }] },
-    flange: { name: 'Flanger', params: [{ id: 'p1', label: 'Depth', min: 0, max: 1, step: 0.05, default: 0.5 }, { id: 'p2', label: 'Feedback', min: 0, max: 1, step: 0.05, default: 0.7 }] },
-    phase: { name: 'Phaser', params: [{ id: 'p1', label: 'Depth', min: 0, max: 1, step: 0.05, default: 0.5 }, { id: 'p2', label: 'Rate', min: 0, max: 1, step: 0.05, default: 0.2 }] },
-    compress: { name: 'Compressor', params: [{ id: 'p1', label: 'Threshold', min: 0, max: 1, step: 0.01, default: 0.5 }, { id: 'p2', label: 'Ratio', min: 1, max: 20, step: 1, default: 4 }] },
-    convolve: { name: 'Convolution', params: [{ id: 'ir', label: 'IR File', type: 'text', default: 'ir.wav' }] }
+    gain: { name: 'Gain', desc: "Linearly scales the signal amplitude.", params: [{ id: 'p1', label: 'Multiplier', min: 0, max: 5, step: 0.1, default: 1.0 }] },
+    pan: { name: 'Pan', desc: "Adjusts left/right stereo balance.", params: [{ id: 'p1', label: 'L/R Balance', min: -1, max: 1, step: 0.05, default: 0.0 }] },
+    eq: { name: 'EQ', desc: "Simple one-band parametric equalizer.", params: [{ id: 'p1', label: 'Center Freq', min: 0, max: 1, step: 0.05, default: 0.5 }, { id: 'p2', label: 'Gain', min: 0, max: 5, step: 0.1, default: 2.0 }] },
+    lowpass: { name: 'Lowpass Filter', desc: "Attenuates high frequencies.", params: [{ id: 'p1', label: 'Strength', min: 0, max: 1, step: 0.05, default: 0.5 }] },
+    distortion: { name: 'Distortion', desc: "Applies soft-clipping overdrive.", params: [{ id: 'p1', label: 'Drive', min: 1, max: 20, step: 0.5, default: 2.0 }] },
+    bitcrush: { name: 'Bitcrusher', desc: "Reduces bit depth for lo-fi digital grit.", params: [{ id: 'p1', label: 'Bits', min: 1, max: 16, step: 1, default: 8 }] },
+    compress: { name: 'Compressor', desc: "Reduces dynamic range of loud signals.", params: [{ id: 'p1', label: 'Threshold', min: 0, max: 1, step: 0.01, default: 0.5 }, { id: 'p2', label: 'Ratio', min: 1, max: 20, step: 1, default: 4 }] },
+    gate: { name: 'Noise Gate', desc: "Silences signal below threshold.", params: [{ id: 'p1', label: 'Threshold', min: 0, max: 1, step: 0.01, default: 0.1 }, { id: 'p2', label: 'Reduction', min: 0, max: 1, step: 0.05, default: 0.0 }] },
+    autowah: { name: 'Auto-Wah', desc: "A modulated sweeping envelope filter.", params: [] },
+    chorus: { name: 'Chorus', desc: "Thickens sound with modulated delays.", params: [] },
+    flange: { name: 'Flanger', desc: "Comb filtering with a sweeping LFO.", params: [{ id: 'p1', label: 'Depth', min: 0, max: 1, step: 0.05, default: 0.5 }, { id: 'p2', label: 'Feedback', min: 0, max: 1, step: 0.05, default: 0.7 }] },
+    phase: { name: 'Phaser', desc: "Sweeping phase cancellation effect.", params: [{ id: 'p1', label: 'Depth', min: 0, max: 1, step: 0.05, default: 0.5 }, { id: 'p2', label: 'Rate', min: 0, max: 1, step: 0.05, default: 0.2 }] },
+    tremolo: { name: 'Tremolo', desc: "Rhythmic volume/amplitude modulation.", params: [{ id: 'p1', label: 'Freq (Hz)', min: 0, max: 20, step: 0.5, default: 5.0 }, { id: 'p2', label: 'Depth', min: 0, max: 1, step: 0.05, default: 0.8 }] },
+    widening: { name: 'Stereo Widening', desc: "Enhances the stereo field.", params: [{ id: 'p1', label: 'Width', min: 1, max: 3, step: 0.1, default: 1.5 }] },
+    ringmod: { name: 'Ring Modulator', desc: "Multiplies signal with an oscillator.", params: [{ id: 'p1', label: 'Freq (Hz)', min: 20, max: 5000, step: 10, default: 440 }] },
+    pitch: { name: 'Pitch Shift', desc: "Changes pitch without changing speed.", params: [{ id: 'p1', label: 'Ratio', min: 0.5, max: 2.0, step: 0.05, default: 1.0 }] },
+    echo: { name: 'Echo / Delay', desc: "Repeats the signal over time.", params: [{ id: 'p1', label: 'Delay (smp)', min: 100, max: 40000, step: 100, default: 4410 }, { id: 'p2', label: 'Decay', min: 0, max: 1, step: 0.05, default: 0.5 }] },
+    pingpong: { name: 'Ping-Pong Delay', desc: "Stereo delay bouncing left and right.", params: [{ id: 'p1', label: 'Delay (smp)', min: 100, max: 40000, step: 100, default: 8820 }, { id: 'p2', label: 'Decay', min: 0, max: 1, step: 0.05, default: 0.5 }] },
+    reverb: { name: 'Reverb (Alg)', desc: "Simulates acoustic space via algorithms.", params: [{ id: 'p1', label: 'Size', min: 0, max: 1, step: 0.05, default: 0.6 }, { id: 'p2', label: 'Mix', min: 0, max: 1, step: 0.05, default: 0.5 }] },
+    convolve: { name: 'Convolution Reverb', desc: "Applies an impulse response file (FFT based).", params: [{ id: 'ir', label: 'IR File', type: 'text', default: 'ir.wav' }] },
+    freeze: { name: 'Spectral Freeze', desc: "Smears transients via random phases.", params: [] }
 };
 
 let effectChain = [];
@@ -114,7 +125,11 @@ function renderChain() {
         module.innerHTML = `
             <div class="drag-handle">⋮⋮</div>
             <div class="fx-info">
-                <h4>${index + 1}. ${config.name}</h4>
+                <h4>
+                    ${index + 1}. ${config.name}
+                    <span class="info-icon" title="${config.desc || ''}" onclick="alert('${config.desc || ''}')">ℹ️</span>
+                </h4>
+                ${config.desc ? `<div class="fx-desc">${config.desc}</div>` : ''}
                 <div class="params">${paramsHtml}</div>
             </div>
             <button class="remove-btn" onclick="removeEffect(${fx.id})">✕</button>
@@ -329,6 +344,14 @@ processBtn.addEventListener('click', async () => {
                 audioPlayer.src = `${result.audio}?t=${Date.now()}`;
                 audioPlayer.load();
                 audioContainer.classList.remove('hidden');
+            }
+
+            // Set up download button
+            const downloadBtn = document.getElementById('downloadBtn');
+            if (downloadBtn) {
+                downloadBtn.onclick = () => {
+                    window.location.href = '/download/' + result.output;
+                };
             }
 
             // Canvas waveform visualization
