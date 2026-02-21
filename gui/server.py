@@ -23,7 +23,7 @@ ENGINE_PATH = os.path.join(ROOT_DIR, 'clfx.exe' if _is_win else 'clfx')
 OUTPUT_DIR  = '/tmp/clfx_output'  if _is_cloud else os.path.join(GUI_DIR, 'output')
 UPLOADS_DIR = '/tmp/clfx_uploads' if _is_cloud else os.path.join(GUI_DIR, 'uploads')
 
-GUI_VERSION = "1.0.1"
+GUI_VERSION = "1.0.2"
 
 VALID_EFFECTS = {
     'gain', 'pan', 'eq', 'lowpass', 'distortion', 'bitcrush', 'compress', 'gate',

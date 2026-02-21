@@ -1,4 +1,4 @@
-# OpenCL Audio Effects Engine (CLFX) v1.0.1
+# OpenCL Audio Effects Engine (CLFX) v1.0.2
 
 [![Build & Test](https://github.com/kv244/vibecoding/actions/workflows/build.yml/badge.svg)](https://github.com/kv244/vibecoding/actions/workflows/build.yml)
 
