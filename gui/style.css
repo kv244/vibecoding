@@ -138,6 +138,29 @@ input[type="text"]:focus {
     border-color: var(--primary);
 }
 
+/* Dropdown - explicit colors needed to override OS dark mode rendering */
+select {
+    background: #1a1d26;
+    color: var(--text);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    outline: none;
+    appearance: auto;
+    transition: border 0.3s;
+}
+
+select:focus {
+    border-color: var(--primary);
+}
+
+select option {
+    background: #1a1d26;
+    color: var(--text);
+}
+
 .sr-only {
     position: absolute;
     width: 1px;

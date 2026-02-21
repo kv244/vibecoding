@@ -222,21 +222,27 @@ async function fetchSystemInfo() {
         const response = await fetch('/system-info');
         const data = await response.json();
 
-        osInfoSpan.innerText = data.os;
-        guiVerSpan.innerText = data.gui_version;
-        engineVerSpan.innerText = data.engine_version;
+        osInfoSpan.innerText = data.os || 'Unknown OS';
+        guiVerSpan.innerText = data.gui_version || '?';
+        engineVerSpan.innerText = data.engine_version || '?';
 
-        if (Array.isArray(data.engine)) {
+        if (Array.isArray(data.engine) && data.engine.length > 0) {
             // Find the first device if available
-            const device = data.engine.find(line => line.includes('Device')) || "Clfx Engine Ready";
+            const device = data.engine.find(line => line.includes('Device')) || data.engine[0];
             engineInfoSpan.innerText = device.replace('Device[0]:', 'GPU:').trim();
             engineInfoSpan.title = data.engine.join('\n'); // Show full info on hover
+        } else if (typeof data.engine === 'string' && data.engine.startsWith('Probe failed')) {
+            // Engine binary not found or not yet compiled - show graceful message
+            engineInfoSpan.innerText = 'Engine: Not Compiled';
+            engineInfoSpan.title = data.engine;
         } else {
-            engineInfoSpan.innerText = "Engine: Ready";
+            engineInfoSpan.innerText = 'Engine: Ready';
         }
     } catch (e) {
-        osInfoSpan.innerText = "System Probing Failed";
-        engineInfoSpan.innerText = "Engine Offline";
+        osInfoSpan.innerText = 'Server Offline';
+        engineInfoSpan.innerText = 'Cannot reach backend';
+        engineVerSpan.innerText = '?';
+        guiVerSpan.innerText = '?';
     }
 }
 
