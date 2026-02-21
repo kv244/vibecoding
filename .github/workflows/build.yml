@@ -94,9 +94,10 @@ jobs:
         file clfx.exe
         ./clfx.exe --info || true   # info probe (non-zero exit ok if no GPU)
 
-    - name: Generate Test WAV and Run Effects
+    - name: Generate Test WAV
+      shell: pwsh
       run: |
-        python3 - <<'EOF'
+        python -c "
         import wave, struct, math
         sample_rate = 44100
         f = wave.open('input.wav', 'w')
@@ -105,7 +106,10 @@ jobs:
             val = int(32767 * math.sin(2 * math.pi * 440 * i / sample_rate))
             f.writeframesraw(struct.pack('<hh', val, val))
         f.close()
-        EOF
+        "
+
+    - name: Run Effects
+      run: |
         ./clfx.exe input.wav out_gain.wav gain 1.5
         ./clfx.exe input.wav out_echo.wav echo 4410 0.5
 
@@ -117,3 +121,44 @@ jobs:
       with:
         name: clfx-windows
         path: clfx.exe
+
+  # ─── Deploy to GCP Cloud Run ────────────────────────────────────────────────
+  deploy-cloudrun:
+    name: Deploy to Cloud Run
+    needs: [build-linux, build-windows]
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Authenticate to GCP
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure Docker for Google Container Registry
+      run: gcloud auth configure-docker us-central1-docker.pkg.dev
+
+    - name: Build and Push Docker image
+      run: |
+        PROJECT_ID=$(gcloud config get-value project)
+        # Using Artifact Registry format (create the repository first!)
+        IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/clfx-repo/clfx-engine:latest"
+        docker build -t "$IMAGE" .
+        docker push "$IMAGE"
+
+    - name: Deploy to Cloud Run
+      run: |
+        PROJECT_ID=$(gcloud config get-value project)
+        IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/clfx-repo/clfx-engine:latest"
+        gcloud run deploy clfx-server \
+          --image "$IMAGE" \
+          --region us-central1 \
+          --platform managed \
+          --allow-unauthenticated \
+          --memory 512Mi \
+          --cpu 1 \
+          --port 8080

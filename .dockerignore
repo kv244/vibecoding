@@ -1,0 +1,33 @@
+# Compiled binaries (we compile fresh inside Docker)
+clfx
+clfx.exe
+*.o
+*.obj
+*.a
+
+# Cygwin runtime (Linux-only Docker, not needed)
+cygwin1.dll
+
+# Windows build artifacts
+build.bat
+compile_errors.txt
+compile_out.txt
+test.c
+libOpenCL.a
+
+# Git history
+.git
+.gitignore
+
+# Local upload/output data — not part of the image
+gui/uploads/
+gui/output/
+
+# Dev files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/

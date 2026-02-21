@@ -8,23 +8,25 @@ from flask import Flask, request, send_from_directory, jsonify
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB Limit
 
-# Base path for the clfx engine - use absolute script directory
-GUI_DIR = os.path.dirname(os.path.abspath(__file__))
+# -- Paths ---------------------------------------------------------------
+GUI_DIR  = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(GUI_DIR)
-ENGINE_PATH = os.path.join(ROOT_DIR, 'clfx.exe')
-OUTPUT_DIR = os.path.join(GUI_DIR, 'output')
-UPLOADS_DIR = os.path.join(GUI_DIR, 'uploads')
+
+# K_SERVICE is set automatically by GCP Cloud Run; absent = local dev
+_is_cloud = bool(os.environ.get('K_SERVICE'))
+_is_win   = pf.system() == 'Windows'
+
+# Linux binary inside Docker; .exe on Windows local dev
+ENGINE_PATH = os.path.join(ROOT_DIR, 'clfx.exe' if _is_win else 'clfx')
+
+# Cloud Run: /tmp (ephemeral but writable); local: gui subdirs
+OUTPUT_DIR  = '/tmp/clfx_output'  if _is_cloud else os.path.join(GUI_DIR, 'output')
+UPLOADS_DIR = '/tmp/clfx_uploads' if _is_cloud else os.path.join(GUI_DIR, 'uploads')
 
 GUI_VERSION = "1.0.1"
 
-VALID_EFFECTS = {'gain', 'echo', 'lowpass', 'bitcrush', 'tremolo', 'widening',
-                 'pingpong', 'chorus', 'autowah', 'distortion', 'ringmod',
-                 'pitch', 'gate', 'pan', 'eq', 'freeze', 'convolve', 'compress',
-                 'reverb', 'flange', 'phase', 'lowpass'}
-
 for d in [OUTPUT_DIR, UPLOADS_DIR]:
-    if not os.path.exists(d):
-        os.makedirs(d)
+    os.makedirs(d, exist_ok=True)
 
 def sanitize_path(path, base_dir):
     """Ensure path is within base_dir and normalized."""
@@ -279,3 +281,4 @@ if __name__ == '__main__':
     is_debug = os.environ.get('DEBUG', 'false').lower() == 'true'
     print(f"CLFX Dashboard starting (debug={is_debug}) at http://localhost:5000")
     app.run(port=5000, debug=is_debug)
+
