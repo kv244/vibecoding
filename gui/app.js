@@ -439,6 +439,11 @@ function drawChannel(canvas, peaksL, peaksR, isStereo) {
     if (isStereo) {
         drawPeaks(peaksL, 0, H / 2, '#00f2ff');
         drawPeaks(peaksR, H / 2, H / 2, '#bc13fe');
+
+        ctx.fillStyle = 'rgba(255,255,255,0.7)';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.fillText('L', 5, 12);
+        ctx.fillText('R', 5, H / 2 + 12);
     } else {
         drawPeaks(peaksL, 0, H, '#00f2ff');
     }
