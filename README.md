@@ -151,8 +151,29 @@ Every push to `master` automatically triggers a full build and functional test s
 | `convolve`| IR WAV Path | - | `convolve ir.wav` |
 | `phase`   | Depth (0.0 - 1.0) | Rate (0.0 - 1.0) | `phase 0.5 0.2` |
 | `compress`| Threshold (0.0 - 1.0)| Ratio (1 - 20) | `compress 0.5 4` |
+| `reverb`  | Size (0.0 - 1.0)  | Mix (0.0 - 1.0) | `reverb 0.6 0.5` |
+| `flange`  | Depth (0.0 - 1.0) | Feedback (0.0 - 1.0) | `flange 0.5 0.7` |
 
 - **Mapping Safety**: Implements explicit `clEnqueueUnmapMemObject` for consistent command queue synchronization.
+
+## ☁️ Deploying to Google Cloud (GCP)
+
+CLFX includes a production-ready Dockerfile and a GitHub Actions workflow for zero-downtime, serverless deployment to **Google Cloud Run**. The container compiles the engine natively and uses `pocl` for CPU-based software OpenCL.
+
+### Deployment Setup
+
+1. **Enable GCP APIs**: Ensure you have enabled the **Cloud Run API**, **Artifact Registry API**, and **Cloud Build API**.
+2. **Create the Artifact Registry**:
+   ```bash
+   gcloud artifacts repositories create clfx-repo \
+     --repository-format=docker \
+     --location=us-central1
+   ```
+3. **Configure GitHub Auth**:
+   Create a Google Cloud Service Account with **Cloud Run Admin** and **Artifact Registry Writer** permissions. Generate a JSON key and save it as a repository secret named `GCP_CREDENTIALS` in GitHub Settings > Secrets and variables > Actions.
+
+> [!NOTE]
+> The `deploy-cloudrun` job in `.github/workflows/build.yml` is **commented out by default** to prevent the CI pipeline from failing when the repository is forked or when the required authentication secrets are not yet configured. Once your GCP project and secrets are ready, simply uncomment the job to enable automatic zero-downtime deployments.
 
 ## 🔬 Implementation Details
 
