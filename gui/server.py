@@ -62,12 +62,16 @@ def upload_file():
         # Validate WAV is 16-bit PCM (engine requirement)
         # NOTE: all os.remove() calls must happen AFTER the `with` block so
         #       the file handle is closed first (Windows does not allow deleting open files).
-        bits, ch, wav_err = None, None, None
+        frames, fs, duration = None, None, None
         try:
             import wave
             with wave.open(save_path, 'rb') as wf:
                 bits = wf.getsampwidth() * 8
                 ch   = wf.getnchannels()
+                frames = wf.getnframes()
+                fs = wf.getframerate()
+                if fs > 0:
+                    duration = round(frames / fs, 2)
         except wave.Error as e:
             wav_err = str(e)
         except Exception as e:
@@ -91,8 +95,18 @@ def upload_file():
                          f"Convert with: ffmpeg -i input.wav -acodec pcm_s16le -ar 44100 output.wav"}), 400
 
 
-        return jsonify({"success": True, "filename": safe_filename,
-                        "info": f"Loaded: {ch}ch 16-bit PCM"})
+        info_str = f"Loaded: {ch}ch 16-bit PCM"
+        if duration is not None:
+            info_str = f"{ch}ch · {fs}Hz · {duration}s"
+
+        return jsonify({
+            "success": True, 
+            "filename": safe_filename,
+            "info": info_str,
+            "sample_rate": fs,
+            "duration": duration,
+            "channels": ch
+        })
 
 
     return jsonify({"success": False, "error": "Only WAV files allowed"}), 400

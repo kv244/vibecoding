@@ -216,10 +216,10 @@ async function handleFileSelection(file) {
         const result = await response.json();
         if (result.success) {
             currentInputFile = result.filename;
-            uploadHint.innerText = result.info || 'Upload Complete!';
-            selectedFileName.innerText = `Selected: ${file.name}`;
+            selectedFileName.innerHTML = `${file.name}<br><span style="font-size: 0.8em; color: #8892b0; font-weight: normal;">${result.info}</span>`;
+            uploadHint.innerText = '';
             document.getElementById('convert-hint').classList.add('hidden');
-            showToast('✅ File uploaded');
+            showToast('File uploaded successfully');
         } else {
             uploadHint.innerText = 'Upload Failed — see hint below';
             selectedFileName.innerText = '';
