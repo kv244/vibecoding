@@ -1,4 +1,6 @@
-# OpenCL Audio Effects Engine (CLFX)
+# OpenCL Audio Effects Engine (CLFX) v1.0.1
+
+[![Build & Test](https://github.com/kv244/vibecoding/actions/workflows/build.yml/badge.svg)](https://github.com/kv244/vibecoding/actions/workflows/build.yml)
 
 A high-performance, hardened, and multiplatform-safe OpenCL audio processing engine for WAV files. Optimized for modern GPUs (including Intel Iris Xe) with vectorization, local memory caching, and zero-copy unified memory support.
 
@@ -109,6 +111,17 @@ CLFX includes a professional-grade web dashboard for building effect chains visu
    ```
 3. Open your browser to `http://localhost:5000`.
 
+## 🤖 CI/CD
+
+Every push to `master` automatically triggers a full build and functional test suite via **GitHub Actions** on Ubuntu:
+1. **Install**: Installs OpenCL runtime (`pocl-opencl-icd`)
+2. **Compile**: Builds `clfx` from source using GCC
+3. **Probe**: Runs `clfx --info` to verify the binary can detect platform/device info
+4. **Generate**: Creates a synthetic stereo 440Hz WAV input using Python
+5. **Test Core Effects**: Gain, Lowpass, Echo
+6. **Test Advanced Effects**: Bitcrush, Spectral Freeze, Noise Gate
+7. **Validate**: Confirms all output WAV files were written successfully
+
 ### Features:
 - **Drag-and-Drop FX Rack**: Reorder your signal chain visually to control the processing path instantly.
 - **Hardware Status Bar**: Real-time display of the host OS and active OpenCL device (GPU/CPU) via automated system probing (`--info` flag).
@@ -157,5 +170,5 @@ CLFX now supports frequency-domain processing through a self-contained **Radix-2
 > Spectral effects force a `local_size` of 256 in `main.c` to guarantee full coverage of the 1024-point FFT window (256 work-items * 4 samples per item), ensuring maximum hardware utilization on modern GPUs.
 
 ---
-**Last Commit:** 2026-02-21
+**Version:** 1.0.1 | **Last Commit:** 2026-02-21
 Developed for high-performance audio experimentation.
