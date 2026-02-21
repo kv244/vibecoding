@@ -95,7 +95,11 @@
             </div>
 
             <div id="audio-container" class="card glass audio-preview hidden">
-                <h3>PREVIEW</h3>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <h3>PREVIEW</h3>
+                    <button id="downloadBtn" class="primary-btn"
+                        style="width: auto; padding: 8px 16px; font-size: 0.9em;">💾 Save WAV</button>
+                </div>
                 <audio id="outputAudio" controls aria-label="Processed audio output"></audio>
             </div>
 
