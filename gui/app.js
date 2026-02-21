@@ -210,8 +210,9 @@ async function handleFileSelection(file) {
         } else {
             uploadHint.innerText = 'Upload Failed — see hint below';
             selectedFileName.innerText = '';
-            // Check if it's a bit-depth error — show the conversion hint banner
-            const isBitDepthError = result.error && result.error.includes('16-bit');
+            // Show conversion hint for bit-depth or compressed format errors
+            const isBitDepthError = result.error &&
+                (result.error.includes('16-bit') || result.error.includes('compressed') || result.error.includes('non-PCM'));
             if (isBitDepthError) {
                 const baseName = file.name.replace(/\.[^.]+$/, '');
                 const cmd = `ffmpeg -i "${file.name}" -acodec pcm_s16le -ar 44100 "${baseName}_16bit.wav"`;

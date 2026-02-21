@@ -52,19 +52,36 @@ def upload_file():
         file.save(save_path)
 
         # Validate WAV is 16-bit PCM (engine requirement)
+        # NOTE: all os.remove() calls must happen AFTER the `with` block so
+        #       the file handle is closed first (Windows does not allow deleting open files).
+        bits, ch, wav_err = None, None, None
         try:
             import wave
             with wave.open(save_path, 'rb') as wf:
                 bits = wf.getsampwidth() * 8
-                ch = wf.getnchannels()
-                if bits != 16:
-                    os.remove(save_path)
-                    return jsonify({"success": False,
-                        "error": f"Engine requires 16-bit PCM WAV, but this file is {bits}-bit. "
-                                 f"Convert with: ffmpeg -i input.wav -acodec pcm_s16le -ar 44100 output.wav"}), 400
+                ch   = wf.getnchannels()
+        except wave.Error as e:
+            wav_err = str(e)
         except Exception as e:
-            os.remove(save_path)
-            return jsonify({"success": False, "error": f"Invalid WAV file: {e}"}), 400
+            wav_err = str(e)
+
+        if wav_err is not None:
+            try: os.remove(save_path)
+            except OSError: pass
+            err_lower = wav_err.lower()
+            if 'unknown format' in err_lower or 'format' in err_lower:
+                return jsonify({"success": False,
+                    "error": "Engine requires 16-bit PCM WAV, but this file uses a compressed/non-PCM format "
+                             f"({wav_err}). Convert with: ffmpeg -i input.wav -acodec pcm_s16le -ar 44100 output.wav"}), 400
+            return jsonify({"success": False, "error": f"Invalid WAV file: {wav_err}"}), 400
+
+        if bits != 16:
+            try: os.remove(save_path)
+            except OSError: pass
+            return jsonify({"success": False,
+                "error": f"Engine requires 16-bit PCM WAV, but this file is {bits}-bit. "
+                         f"Convert with: ffmpeg -i input.wav -acodec pcm_s16le -ar 44100 output.wav"}), 400
+
 
         return jsonify({"success": True, "filename": safe_filename,
                         "info": f"Loaded: {ch}ch 16-bit PCM"})
