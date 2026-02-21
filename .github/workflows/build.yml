@@ -21,6 +21,37 @@ jobs:
       run: |
         gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L
         
-    - name: Verify Binary
+    - name: Verify Binary Info
       run: |
         ./clfx --info
+
+    - name: Generate Functional Test Input
+      run: |
+        python3 - <<EOF
+        import wave, struct, math
+        sample_rate = 44100
+        f = wave.open('input.wav', 'wb')
+        f.setnchannels(2)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        for i in range(44100):
+            val = int(32767 * math.sin(2 * math.pi * 440 * i / sample_rate))
+            f.writeframesraw(struct.pack('<hh', val, val))
+        f.close()
+        EOF
+
+    - name: Test Core Effects (Gain, Lowpass, Echo)
+      run: |
+        ./clfx input.wav out_gain.wav gain 1.5
+        ./clfx input.wav out_lp.wav lowpass 0.8
+        ./clfx input.wav out_echo.wav echo 4410 0.5
+        
+    - name: Test Advanced Effects (Spectral, Dynamics)
+      run: |
+        ./clfx input.wav out_bit.wav bitcrush 8
+        ./clfx input.wav out_freeze.wav freeze 0.5 0.5
+        ./clfx input.wav out_gate.wav gate 0.1 0.0
+        
+    - name: Verify Outputs Generated
+      run: |
+        ls -lh out_*.wav
