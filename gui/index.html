@@ -47,61 +47,63 @@
                             aria-label="Copy command">Copy</button>
                     </div>
                 </div>
+        </section>
 
-                <div class="card glass chain-card">
-                    <div class="card-header">
-                        <h3>SIGNAL CHAIN</h3>
-                        <div class="add-fx">
-                            <label for="fxSelect" class="sr-only">Add Effect</label>
-                            <select id="fxSelect">
-                                <option value="">+ Add Effect...</option>
-                                <option value="gain">Gain</option>
-                                <option value="pan">Pan</option>
-                                <option value="eq">EQ</option>
-                                <option value="lowpass">Lowpass Filter</option>
-                                <option value="distortion">Distortion</option>
-                                <option value="bitcrush">Bitcrusher</option>
-                                <option value="compress">Compressor</option>
-                                <option value="gate">Noise Gate</option>
-                                <option value="autowah">Auto-Wah</option>
-                                <option value="chorus">Chorus</option>
-                                <option value="flange">Flanger</option>
-                                <option value="phase">Phaser</option>
-                                <option value="tremolo">Tremolo</option>
-                                <option value="widening">Stereo Widening</option>
-                                <option value="ringmod">Ring Modulator</option>
-                                <option value="pitch">Pitch Shift</option>
-                                <option value="echo">Echo / Delay</option>
-                                <option value="pingpong">Ping-Pong Delay</option>
-                                <option value="reverb">Reverb (Algorithmic)</option>
-                                <option value="convolve">Convolution Reverb</option>
-                                <option value="freeze">Spectral Freeze</option>
-                            </select>
-                        </div>
+        <section id="processor">
+            <div class="card glass chain-card">
+                <div class="card-header">
+                    <h3>SIGNAL CHAIN</h3>
+                    <div class="add-fx">
+                        <label for="fxSelect" class="sr-only">Add Effect</label>
+                        <select id="fxSelect">
+                            <option value="">+ Add Effect...</option>
+                            <option value="gain">Gain</option>
+                            <option value="pan">Pan</option>
+                            <option value="eq">EQ</option>
+                            <option value="lowpass">Lowpass Filter</option>
+                            <option value="distortion">Distortion</option>
+                            <option value="bitcrush">Bitcrusher</option>
+                            <option value="compress">Compressor</option>
+                            <option value="gate">Noise Gate</option>
+                            <option value="autowah">Auto-Wah</option>
+                            <option value="chorus">Chorus</option>
+                            <option value="flange">Flanger</option>
+                            <option value="phase">Phaser</option>
+                            <option value="tremolo">Tremolo</option>
+                            <option value="widening">Stereo Widening</option>
+                            <option value="ringmod">Ring Modulator</option>
+                            <option value="pitch">Pitch Shift</option>
+                            <option value="echo">Echo / Delay</option>
+                            <option value="pingpong">Ping-Pong Delay</option>
+                            <option value="reverb">Reverb (Algorithmic)</option>
+                            <option value="convolve">Convolution Reverb</option>
+                            <option value="freeze">Spectral Freeze</option>
+                        </select>
                     </div>
                 </div>
+            </div>
 
-                <div id="chain-container">
-                    <!-- Effects will be injected here -->
-                    <div class="empty-hint">Your chain is empty. Add an effect to start.</div>
-                </div>
+            <div id="chain-container">
+                <!-- Effects will be injected here -->
+                <div class="empty-hint">Your chain is empty. Add an effect to start.</div>
+            </div>
 
-                <div class="chain-actions" style="margin-top: 15px;">
-                    <button id="processBtn" class="btn-primary"
-                        style="width: 100%; padding: 12px; font-size: 1.1em; letter-spacing: 1px;">⚙️ PROCESS
-                        AUDIO</button>
-                </div>
+            <div class="chain-actions" style="margin-top: 15px;">
+                <button id="processBtn" class="btn-primary"
+                    style="width: 100%; padding: 12px; font-size: 1.1em; letter-spacing: 1px;">⚙️ PROCESS
+                    AUDIO</button>
+            </div>
 
-                <div id="audio-container" class="card glass audio-preview hidden">
-                    <h3>PREVIEW</h3>
-                    <audio id="outputAudio" controls aria-label="Processed audio output"></audio>
-                </div>
+            <div id="audio-container" class="card glass audio-preview hidden">
+                <h3>PREVIEW</h3>
+                <audio id="outputAudio" controls aria-label="Processed audio output"></audio>
+            </div>
 
-                <div id="viz-container" class="card glass hidden">
-                    <h3>📈 WAVEFORM ANALYSIS</h3>
-                    <div class="viz-meta" id="viz-meta"></div>
-                    <canvas id="waveformCanvas" width="900" height="200"></canvas>
-                </div>
+            <div id="viz-container" class="card glass hidden">
+                <h3>📈 WAVEFORM ANALYSIS</h3>
+                <div class="viz-meta" id="viz-meta"></div>
+                <canvas id="waveformCanvas" width="900" height="200"></canvas>
+            </div>
         </section>
     </main>
 
