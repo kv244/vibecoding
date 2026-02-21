@@ -219,6 +219,15 @@ async function handleFileSelection(file) {
             selectedFileName.innerHTML = `${file.name}<br><span style="font-size: 0.8em; color: #8892b0; font-weight: normal;">${result.info}</span>`;
             uploadHint.innerText = '';
             document.getElementById('convert-hint').classList.add('hidden');
+
+            // Load original audio and wave preview
+            const inputAudio = document.getElementById('inputAudio');
+            if (inputAudio) {
+                inputAudio.src = `/uploads/${result.filename}?t=${Date.now()}`;
+                inputAudio.load();
+            }
+            fetchAndDrawWaveform(result.filename, true);
+
             showToast('File uploaded successfully');
         } else {
             uploadHint.innerText = 'Upload Failed — see hint below';
@@ -275,6 +284,14 @@ async function fetchSystemInfo() {
 
 // --- Interaction ---
 
+const masterMix = document.getElementById('masterMix');
+const mixVal = document.getElementById('mixVal');
+if (masterMix && mixVal) {
+    masterMix.addEventListener('input', (e) => {
+        mixVal.innerText = Math.round(e.target.value * 100) + '%';
+    });
+}
+
 processBtn.addEventListener('click', async () => {
     if (!currentInputFile) {
         showToast("Please upload an input file first");
@@ -292,10 +309,12 @@ processBtn.addEventListener('click', async () => {
 
     showLoader(true);
 
+    const mixLevel = masterMix ? parseFloat(masterMix.value) : 1.0;
+
     const payload = {
         inputFile: currentInputFile,
         outputName,
-        mix: 1.0,  // Master mix removed from UI
+        mix: mixLevel,
         effects: effectChain.map(fx => ({
             type: fx.type,
             ...fx.params
@@ -357,23 +376,29 @@ function showLoader(show) {
 
 // --- Waveform Canvas Renderer ---
 
-async function fetchAndDrawWaveform(outputFilename) {
+async function fetchAndDrawWaveform(filename, isInput = false) {
     try {
         const resp = await fetch('/visualize', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ file: outputFilename })
+            body: JSON.stringify({ file: filename })
         });
         const data = await resp.json();
         if (data.error) { console.warn('Waveform error:', data.error); return; }
 
-        const vizContainer = document.getElementById('viz-container');
-        const canvas = document.getElementById('waveformCanvas');
-        const meta = document.getElementById('viz-meta');
-        meta.innerText = `${data.channels}ch · ${data.sample_rate}Hz · ${data.duration}s`;
-        vizContainer.classList.remove('hidden');
+        const containerId = isInput ? 'input-audio-container' : 'viz-container';
+        const canvasId = isInput ? 'inputWaveformCanvas' : 'waveformCanvas';
+        const metaId = isInput ? null : 'viz-meta';
 
-        drawChannel(canvas, data.peaks_l, data.peaks_r, data.channels > 1);
+        const container = document.getElementById(containerId);
+        const canvas = document.getElementById(canvasId);
+
+        if (metaId) {
+            document.getElementById(metaId).innerText = `${data.channels}ch · ${data.sample_rate}Hz · ${data.duration}s`;
+        }
+        if (container) container.classList.remove('hidden');
+
+        if (canvas) drawChannel(canvas, data.peaks_l, data.peaks_r, data.channels > 1);
     } catch (e) {
         console.warn('Visualization fetch failed:', e);
     }

@@ -46,6 +46,16 @@
                             onclick="navigator.clipboard.writeText(document.getElementById('convert-cmd').innerText).then(()=>this.innerText='&#10003; Copied').catch(()=>{})"
                             aria-label="Copy command">Copy</button>
                     </div>
+                    <!-- Original Audio Preview (Hidden until upload) -->
+                    <div id="input-audio-container" class="card glass hidden"
+                        style="margin-top: 20px; padding: 15px; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <h4 style="margin: 0 0 10px 0; font-size: 0.85em; color: var(--accent); letter-spacing: 1px;">
+                            ORIGINAL AUDIO</h4>
+                        <audio id="inputAudio" controls style="width: 100%; height: 35px; margin-bottom: 10px;"
+                            aria-label="Original audio input"></audio>
+                        <canvas id="inputWaveformCanvas" width="300" height="80"
+                            style="width: 100%; height: 80px; border-radius: 4px; background: rgba(0,0,0,0.2);"></canvas>
+                    </div>
                 </div>
         </section>
 
@@ -89,6 +99,14 @@
             </div>
 
             <div class="chain-actions" style="margin-top: 15px;">
+                <div class="master-mix" style="margin-bottom: 15px;">
+                    <label for="masterMix"
+                        style="display: flex; justify-content: space-between; margin-bottom: 8px; font-weight: bold; color: var(--text);">
+                        <span>WET MIX (Master Gain)</span>
+                        <span id="mixVal">100%</span>
+                    </label>
+                    <input type="range" id="masterMix" min="0" max="1" step="0.05" value="1.0" style="width: 100%;">
+                </div>
                 <button id="processBtn" class="btn-primary"
                     style="width: 100%; padding: 12px; font-size: 1.1em; letter-spacing: 1px;">⚙️ PROCESS
                     AUDIO</button>

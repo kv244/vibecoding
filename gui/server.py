@@ -122,6 +122,12 @@ def download_file(filename):
     filename = os.path.basename(filename)
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
+@app.route('/uploads/<filename>', methods=['GET'])
+def get_upload_file(filename):
+    # Serve original uploaded files for browser playback and visualization
+    filename = os.path.basename(filename)
+    return send_from_directory(UPLOADS_DIR, filename)
+
 @app.route('/system-info', methods=['GET'])
 def get_system_info():
     info = {
@@ -266,7 +272,9 @@ def visualize():
     full_path = os.path.join(OUTPUT_DIR, filename)
 
     if not os.path.exists(full_path):
-        return jsonify({"error": f"File not found: {filename}"}), 404
+        full_path = os.path.join(UPLOADS_DIR, filename)
+        if not os.path.exists(full_path):
+            return jsonify({"error": f"File not found: {filename}"}), 404
 
     try:
         import wave, struct
