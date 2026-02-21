@@ -123,42 +123,42 @@ jobs:
         path: clfx.exe
 
   # ─── Deploy to GCP Cloud Run ────────────────────────────────────────────────
-  deploy-cloudrun:
-    name: Deploy to Cloud Run
-    needs: [build-linux, build-windows]
-    if: github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
+  # deploy-cloudrun:
+  #   name: Deploy to Cloud Run
+  #   needs: [build-linux, build-windows]
+  #   if: github.ref == 'refs/heads/master'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #   - uses: actions/checkout@v4
 
-    - name: Authenticate to GCP
-      uses: google-github-actions/auth@v2
-      with:
-        credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+  #   - name: Authenticate to GCP
+  #     uses: google-github-actions/auth@v2
+  #     with:
+  #       credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
 
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
+  #   - name: Set up Cloud SDK
+  #     uses: google-github-actions/setup-gcloud@v2
 
-    - name: Configure Docker for Google Container Registry
-      run: gcloud auth configure-docker us-central1-docker.pkg.dev
+  #   - name: Configure Docker for Google Container Registry
+  #     run: gcloud auth configure-docker us-central1-docker.pkg.dev
 
-    - name: Build and Push Docker image
-      run: |
-        PROJECT_ID=$(gcloud config get-value project)
-        # Using Artifact Registry format (create the repository first!)
-        IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/clfx-repo/clfx-engine:latest"
-        docker build -t "$IMAGE" .
-        docker push "$IMAGE"
+  #   - name: Build and Push Docker image
+  #     run: |
+  #       PROJECT_ID=$(gcloud config get-value project)
+  #       # Using Artifact Registry format (create the repository first!)
+  #       IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/clfx-repo/clfx-engine:latest"
+  #       docker build -t "$IMAGE" .
+  #       docker push "$IMAGE"
 
-    - name: Deploy to Cloud Run
-      run: |
-        PROJECT_ID=$(gcloud config get-value project)
-        IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/clfx-repo/clfx-engine:latest"
-        gcloud run deploy clfx-server \
-          --image "$IMAGE" \
-          --region us-central1 \
-          --platform managed \
-          --allow-unauthenticated \
-          --memory 512Mi \
-          --cpu 1 \
-          --port 8080
+  #   - name: Deploy to Cloud Run
+  #     run: |
+  #       PROJECT_ID=$(gcloud config get-value project)
+  #       IMAGE="us-central1-docker.pkg.dev/$PROJECT_ID/clfx-repo/clfx-engine:latest"
+  #       gcloud run deploy clfx-server \
+  #         --image "$IMAGE" \
+  #         --region us-central1 \
+  #         --platform managed \
+  #         --allow-unauthenticated \
+  #         --memory 512Mi \
+  #         --cpu 1 \
+  #         --port 8080
