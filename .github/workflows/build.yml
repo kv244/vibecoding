@@ -1,0 +1,26 @@
+name: CLFX Build Verification
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install OpenCL Headers and Runtime
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd
+        
+    - name: Compile Engine
+      run: |
+        gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L
+        
+    - name: Verify Binary
+      run: |
+        ./clfx --info
