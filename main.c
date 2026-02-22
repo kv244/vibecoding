@@ -291,6 +291,12 @@ int main(int argc, char *argv[]) {
     printf("\nOptions:\n");
     printf("  --visualize             Display ASCII waveform\n");
     printf("  --info                  Print system and OpenCL information\n");
+    printf("  --platform <id>         Force specific OpenCL platform (use "
+           "--info to list)\n");
+    printf(
+        "  --device <id>           Force specific OpenCL device on platform\n");
+    printf("  --dump-binary           Dump compiled OpenCL assembly/binary to "
+           "'kernel_compiled.bin'\n");
     return 1;
   }
 
@@ -351,10 +357,18 @@ int main(int argc, char *argv[]) {
   }
 
   int do_visualize = 0;
+  int do_dump_binary = 0;
+  int user_platform = -1;
+  int user_device = -1;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--visualize") == 0) {
       do_visualize = 1;
-      break;
+    } else if (strcmp(argv[i], "--dump-binary") == 0) {
+      do_dump_binary = 1;
+    } else if (strcmp(argv[i], "--platform") == 0 && i + 1 < argc) {
+      user_platform = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+      user_device = atoi(argv[++i]);
     }
   }
 
@@ -371,7 +385,15 @@ int main(int argc, char *argv[]) {
       arg_idx++;
       continue;
     }
-    if (strcmp(argv[arg_idx], "--visualize") == 0) {
+    if (strcmp(argv[arg_idx], "--visualize") == 0 ||
+        strcmp(argv[arg_idx], "--dump-binary") == 0) {
+      arg_idx++;
+      continue;
+    }
+    if (strcmp(argv[arg_idx], "--platform") == 0 ||
+        strcmp(argv[arg_idx], "--device") == 0) {
+      if (arg_idx + 1 < argc)
+        arg_idx++;
       arg_idx++;
       continue;
     }
@@ -633,25 +655,45 @@ int main(int argc, char *argv[]) {
   }
 
   int found_device = 0;
-  // 1. Search for a GPU on any platform
-  for (cl_uint i = 0; i < num_platforms; i++) {
-    err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 1, &device, NULL);
-    if (err == CL_SUCCESS) {
-      platform = platforms[i];
-      found_device = 1;
-      break;
+  if (user_platform >= 0 && user_platform < (int)num_platforms) {
+    platform = platforms[user_platform];
+    cl_uint n_devs;
+    if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &n_devs) ==
+            CL_SUCCESS &&
+        n_devs > 0) {
+      cl_device_id *dev_list = malloc(sizeof(cl_device_id) * n_devs);
+      clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, n_devs, dev_list, NULL);
+      if (user_device >= 0 && user_device < (int)n_devs) {
+        device = dev_list[user_device];
+        found_device = 1;
+      } else {
+        device = dev_list[0];
+        found_device = 1;
+      }
+      free(dev_list);
     }
-  }
-
-  // 2. Fallback: Search for a CPU on any platform
-  if (!found_device) {
+  } else {
+    // 1. Search for a GPU on any platform
     for (cl_uint i = 0; i < num_platforms; i++) {
-      err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_CPU, 1, &device, NULL);
+      err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 1, &device, NULL);
       if (err == CL_SUCCESS) {
-        printf("No GPU found, falling back to CPU...\n");
         platform = platforms[i];
         found_device = 1;
         break;
+      }
+    }
+
+    // 2. Fallback: Search for a CPU on any platform
+    if (!found_device) {
+      for (cl_uint i = 0; i < num_platforms; i++) {
+        err =
+            clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_CPU, 1, &device, NULL);
+        if (err == CL_SUCCESS) {
+          printf("No GPU found, falling back to CPU...\n");
+          platform = platforms[i];
+          found_device = 1;
+          break;
+        }
       }
     }
   }
@@ -717,6 +759,27 @@ int main(int argc, char *argv[]) {
     free(log);
     ret = 1;
     goto cleanup;
+  }
+
+  if (do_dump_binary) {
+    size_t binary_size = 0;
+    err = clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size_t),
+                           &binary_size, NULL);
+    if (err == CL_SUCCESS && binary_size > 0) {
+      unsigned char *binary_data = malloc(binary_size);
+      unsigned char *ptrs[1] = {binary_data};
+      err = clGetProgramInfo(program, CL_PROGRAM_BINARIES,
+                             sizeof(unsigned char *), ptrs, NULL);
+      if (err == CL_SUCCESS) {
+        FILE *bf = fopen("kernel_compiled.bin", "wb");
+        if (bf) {
+          fwrite(binary_data, 1, binary_size, bf);
+          fclose(bf);
+          printf("Dumped compiled OpenCL binary to 'kernel_compiled.bin'\n");
+        }
+      }
+      free(binary_data);
+    }
   }
 
   kernel = clCreateKernel(program, "apply_effects", &err);

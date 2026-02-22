@@ -89,8 +89,13 @@ if __name__ == "__main__":
 Run the executable with an input WAV file (uncompressed PCM, 16-bit) and specify the effect:
 
 ```bash
-./clfx.exe <input.wav> <output.wav> <effect> [param1] [param2]
+./clfx.exe <input.wav> <output.wav> <effect> [param1] [param2] [--platform <id>] [--device <id>] [--dump-binary]
 ```
+
+### Global Options:
+- `--platform <id>`: Force execution on a specific OpenCL platform (use `--info` to discover IDs).
+- `--device <id>`: Force execution on a specific OpenCL device within the chosen platform.
+- `--dump-binary`: Extract the driver-compiled device binary (e.g. PTX code for NVIDIA, native ISA for Intel) and save it to `kernel_compiled.bin` in the current directory.
 
 ### Effects & Parameters:
 
