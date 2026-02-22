@@ -727,34 +727,32 @@ int main(int argc, char *argv[]) {
   size_t alignSize = local_block_size * samplesPerWorkItem;
   int paddedSamples = ((numSamples + alignSize - 1) / alignSize) * alignSize;
 
-  // Aligned allocation for zero-copy
-  h_input = port_aligned_alloc(sizeof(float) * paddedSamples, 4096);
-  h_output = port_aligned_alloc(sizeof(float) * paddedSamples, 4096);
-  if (!h_input || !h_output) {
-    perror("port_aligned_alloc failed");
-    ret = 1;
-    goto cleanup;
-  }
+  // 1. Create a "Pinned" buffer for ping-pong
+  d_in = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                        sizeof(float) * paddedSamples, NULL, &err);
+  checkErr(err, "clCreateBuffer (d_in)");
 
-  // Initialize with zero (padding) and copy data
+  d_out = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                         sizeof(float) * paddedSamples, NULL, &err);
+  checkErr(err, "clCreateBuffer (d_out)");
+
+  d_initial_in = d_in;
+  d_initial_out = d_out;
+
+  // 2. "Map" it to get a pointer your C code can use.
+  h_input = (float *)clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_WRITE, 0,
+                                        sizeof(float) * paddedSamples, 0, NULL,
+                                        NULL, &err);
+  checkErr(err, "clEnqueueMapBuffer (d_in)");
+
+  // 3. Fill the buffer with audio data
   memset(h_input, 0, sizeof(float) * paddedSamples);
   for (int i = 0; i < numSamples; i++)
     h_input[i] = raw_data[i] / 32768.0f;
 
-  // Create ping-pong buffers
-  cl_mem_flags in_out_flags = unified
-                                  ? (CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR)
-                                  : (CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR);
-  cl_mem_flags out_only_flags =
-      unified ? (CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR) : CL_MEM_READ_WRITE;
-
-  d_in = clCreateBuffer(context, in_out_flags, sizeof(float) * paddedSamples,
-                        h_input, &err);
-  d_out = clCreateBuffer(context, out_only_flags, sizeof(float) * paddedSamples,
-                         (unified ? h_output : NULL), &err);
-  d_initial_in = d_in;
-  d_initial_out = d_out;
-  checkErr(err, "clCreateBuffer (d_in/d_out)");
+  // 4. "Unmap" it before the GPU uses it.
+  clEnqueueUnmapMemObject(queue, d_in, h_input, 0, NULL, NULL);
+  h_input = NULL;
 
   err = clGetKernelWorkGroupInfo(kernel, device,
                                  CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
@@ -942,24 +940,10 @@ int main(int argc, char *argv[]) {
 
   // Final result is in d_in (due to the swap after the last kernel call)
   // --- 4. Read Result ---
-  // The final result is in d_in due to the swap at the end of the loop
-  if (unified) {
-    void *mapped_ptr =
-        clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_READ, 0,
-                           sizeof(float) * numSamples, 0, NULL, NULL, &err);
-    checkErr(err, "clEnqueueMapBuffer (final)");
-    // If d_in is not already using h_output, we must copy.
-    // If it is using it (odd swap), memcpy to self is harmless or we can skip.
-    if (mapped_ptr != h_output) {
-      memcpy(h_output, mapped_ptr, sizeof(float) * numSamples);
-    }
-    clEnqueueUnmapMemObject(queue, d_in, mapped_ptr, 0, NULL, NULL);
-  } else {
-    err =
-        clEnqueueReadBuffer(queue, d_in, CL_TRUE, 0, sizeof(float) * numSamples,
-                            h_output, 0, NULL, NULL);
-    checkErr(err, "clEnqueueReadBuffer (final)");
-  }
+  h_output = (float *)clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_READ, 0,
+                                         sizeof(float) * numSamples, 0, NULL,
+                                         NULL, &err);
+  checkErr(err, "clEnqueueMapBuffer (final)");
 
   // --- 3. Save WAV File ---
   for (int i = 0; i < numSamples; i++) {
@@ -993,10 +977,8 @@ cleanup:
     fclose(out_fp);
   free(raw_data);
   free(source);
-  if (h_input)
-    port_aligned_free(h_input);
-  if (h_output)
-    port_aligned_free(h_output);
+  if (h_output && queue && d_in)
+    clEnqueueUnmapMemObject(queue, d_in, h_output, 0, NULL, NULL);
   if (h_ir)
     port_aligned_free(h_ir);
   if (d_initial_in)
