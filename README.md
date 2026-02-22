@@ -21,7 +21,7 @@ A high-performance, hardened, and multiplatform-safe OpenCL audio processing eng
 ## 🛠️ Performance Optimizations
 
 1. **Vectorization**: Uses `float4` types to process 4 samples simultaneously per work-item, maximizing SIMD hardware utilization.
-2. **Unified Memory (Zero-Copy)**: Automatically detects integrated GPUs (like Intel Iris Xe) and uses `CL_MEM_USE_HOST_PTR` to eliminate unnecessary data copies between CPU and GPU.
+2. **Pinned Buffer Mapping (Zero-Copy)**: Utilizes `CL_MEM_ALLOC_HOST_PTR` and `clEnqueueMapBuffer` to allocate and map "pinned" host memory. This ensures cross-platform zero-copy efficiency on platforms like Intel architectures, and creates optimal staging areas syncing with VRAM on NVIDIA GPUs.
 3. **Local Memory Caching**: The low-pass filter captures a "tile" of samples into fast `__local` memory, reducing global memory bandwidth requirements.
 4. **Adaptive Scaling**: Queries `CL_DEVICE_MAX_WORK_GROUP_SIZE` and passes it to the kernel via compiler flags (`-DTILE_SIZE=n`) to ensure the code never exceeds hardware constraints.
 5. **CPU Precomputation**: Offloads complex math (like bitcrush level power calculations) to the CPU, keeping the GPU kernel lean and fast.
@@ -206,5 +206,5 @@ CLFX now supports frequency-domain processing through a self-contained **Radix-2
 > Spectral effects force a `local_size` of 256 in `main.c` to guarantee full coverage of the 1024-point FFT window (256 work-items * 4 samples per item), ensuring maximum hardware utilization on modern GPUs.
 
 ---
-**Version:** 1.0.1 | **Last Commit:** 2026-02-21
+**Version:** 1.0.2 | **Last Commit:** 2026-02-22
 Developed for high-performance audio experimentation.
