@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLFX | Advanced Audio Engine</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="glow" aria-hidden="true"></div>
+
+    <header>
+        <div class="logo">CLFX<span>Engine</span></div>
+        <div class="status" id="engineStatus">Engine: Ready</div>
+    </header>
+
+    <main>
+        <section id="file-hub">
+            <div class="card glass">
+                <h3><span class="icon">📁</span> File Hub</h3>
+
+                <div id="upload-zone" class="upload-zone">
+                    <input type="file" id="fileInput" accept=".wav" hidden>
+                    <div class="upload-content">
+                        <span class="icon">☁️</span>
+                        <p id="upload-hint">Drag & Drop or Click &nbsp;&middot;&nbsp; 16-bit PCM WAV only</p>
+                        <span id="selectedFileName"></span>
+                    </div>
+                </div>
+
+                <!-- 16-bit conversion hint -->
+                <div id="convert-hint" class="convert-hint hidden" role="alert">
+                    <div class="convert-hint-header">
+                        <span>&#9888;&#65039; Wrong WAV Format</span>
+                        <button class="hint-close"
+                            onclick="document.getElementById('convert-hint').classList.add('hidden')"
+                            aria-label="Dismiss">&#x2715;</button>
+                    </div>
+                    <p id="convert-hint-msg"></p>
+                    <p class="convert-hint-label">Convert with ffmpeg:</p>
+                    <div class="convert-cmd-row">
+                        <code id="convert-cmd"></code>
+                        <button class="copy-btn"
+                            onclick="navigator.clipboard.writeText(document.getElementById('convert-cmd').innerText).then(()=>this.innerText='&#10003; Copied').catch(()=>{})"
+                            aria-label="Copy command">Copy</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Original Audio Preview (Hidden until upload) -->
+            <div id="input-audio-container" class="card glass hidden"
+                style="margin-top: 20px; padding: 15px; border-top: 1px solid rgba(255,255,255,0.1);">
+                <h4 style="margin: 0 0 10px 0; font-size: 0.85em; color: var(--accent); letter-spacing: 1px;">
+                    ORIGINAL AUDIO</h4>
+                <audio id="inputAudio" controls style="width: 100%; height: 35px; margin-bottom: 10px;"
+                    aria-label="Original audio input"></audio>
+                <canvas id="inputWaveformCanvas" width="300" height="80"
+                    style="width: 100%; height: 80px; border-radius: 4px; background: rgba(0,0,0,0.2);"></canvas>
+            </div>
+            </div>
+        </section>
+
+        <section id="processor">
+            <div class="card glass chain-card">
+                <div class="card-header">
+                    <h3>SIGNAL CHAIN</h3>
+                    <div class="add-fx">
+                        <label for="fxSelect" class="sr-only">Add Effect</label>
+                        <select id="fxSelect">
+                            <option value="">+ Add Effect...</option>
+                            <option value="gain">Gain</option>
+                            <option value="pan">Pan</option>
+                            <option value="eq">EQ</option>
+                            <option value="lowpass">Lowpass Filter</option>
+                            <option value="distortion">Distortion</option>
+                            <option value="bitcrush">Bitcrusher</option>
+                            <option value="compress">Compressor</option>
+                            <option value="gate">Noise Gate</option>
+                            <option value="autowah">Auto-Wah</option>
+                            <option value="chorus">Chorus</option>
+                            <option value="flange">Flanger</option>
+                            <option value="phase">Phaser</option>
+                            <option value="tremolo">Tremolo</option>
+                            <option value="widening">Stereo Widening</option>
+                            <option value="ringmod">Ring Modulator</option>
+                            <option value="pitch">Pitch Shift</option>
+                            <option value="echo">Echo / Delay</option>
+                            <option value="pingpong">Ping-Pong Delay</option>
+                            <option value="reverb">Reverb (Algorithmic)</option>
+                            <option value="convolve">Convolution Reverb</option>
+                            <option value="freeze">Spectral Freeze</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <div id="chain-container">
+                <!-- Effects will be injected here -->
+                <div class="empty-hint">Your chain is empty. Add an effect to start.</div>
+            </div>
+
+            <div class="chain-actions" style="margin-top: 15px;">
+                <div class="master-mix" style="margin-bottom: 15px;">
+                    <label for="masterMix"
+                        style="display: flex; justify-content: space-between; margin-bottom: 8px; font-weight: bold; color: var(--text);">
+                        <span>WET MIX (Master Gain)</span>
+                        <span id="mixVal">100%</span>
+                    </label>
+                    <input type="range" id="masterMix" min="0" max="1" step="0.05" value="1.0" style="width: 100%;">
+                </div>
+                <button id="processBtn" class="btn-primary"
+                    style="width: 100%; padding: 12px; font-size: 1.1em; letter-spacing: 1px;">⚙️ PROCESS
+                    AUDIO</button>
+            </div>
+
+            <div id="audio-container" class="card glass audio-preview hidden">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <h3>PREVIEW</h3>
+                    <button id="downloadBtn" class="primary-btn"
+                        style="width: auto; padding: 8px 16px; font-size: 0.9em;">💾 Save WAV</button>
+                </div>
+                <audio id="outputAudio" controls aria-label="Processed audio output"></audio>
+            </div>
+
+            <div id="viz-container" class="card glass hidden">
+                <h3>📈 WAVEFORM ANALYSIS</h3>
+                <div class="viz-meta" id="viz-meta"></div>
+                <canvas id="waveformCanvas" width="900" height="200"></canvas>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast" class="hidden"></div>
+    <div id="loader" class="loader-overlay hidden">
+        <div class="loader"></div>
+        <div class="loader-text" style="color: #00f2ff; margin-top: 20px; font-weight: 600; letter-spacing: 2px;">IN
+            PROGRESS...</div>
+    </div>
+
+    <footer class="system-footer glass">
+        <div class="system-status" id="system-status">
+            <span class="status-dot pulse" aria-hidden="true"></span>
+            <span id="os-info">Probing System...</span>
+            <span class="separator">|</span>
+            <span id="engine-info">Engine: Initializing...</span>
+            <span class="version-tag">Engine v<span id="engine-ver">-.--</span></span>
+            <span class="version-tag">GUI v<span id="gui-ver">-.--</span></span>
+        </div>
+    </footer>
+
+    <script defer src="app.min.js?v=2"></script>
+</body>
+
+</html>

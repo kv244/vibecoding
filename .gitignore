@@ -1,0 +1,8 @@
+clfx.exe
+*.wav
+*.clir
+gui/output/
+__pycache__/
+waveform.png
+.gemini/
+.agents/
