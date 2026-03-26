@@ -27,7 +27,9 @@ See [`clfx/README.md`](./clfx/README.md) for full documentation.
 | File | Description |
 |---|---|
 | `cube.py` | 3D rotating cube renderer with auto-selected backend (CUDA → Numba → NumPy) |
-| `encrypt.cu` | ChaCha20-Poly1305 + Argon2id CUDA file encryptor (RFC 8439 compliant) |
+| `encrypt.cu` | GPU-accelerated file encryptor: ChaCha20-Poly1305 AEAD + Argon2id KDF, streaming chunks, directory mode |
+
+See [`experiments/gpu/README.md`](./experiments/gpu/README.md) for build and usage instructions.
 
 ### [`experiments/ai/`](./experiments/ai)
 | File | Description |
@@ -45,7 +47,6 @@ See [`clfx/README.md`](./clfx/README.md) for full documentation.
 |---|---|
 | `basic_interpreter.py` | Toy BASIC interpreter with 23+ commands and Matplotlib graphics |
 | `harmonies.py` | Musical interval analysis — Lissajous curves, FFT, dyad playback |
-| `tron3D` | Autonomous Tron light-cycle simulation (Pygame, Numba, spatial heatmap AI) |
 
 ---
 *Bridging demanding performance work with AI-assisted creative development.*
