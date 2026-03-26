@@ -70,7 +70,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <random>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -79,9 +78,12 @@
 #  include <termios.h>
 #  include <unistd.h>
 #  include <fcntl.h>
+#  include <sys/random.h>   // getrandom()
 #else
 #  include <windows.h>
+#  include <bcrypt.h>       // BCryptGenRandom
 #  include <conio.h>
+#  pragma comment(lib, "bcrypt.lib")
 #endif
 
 namespace fs = std::filesystem;
@@ -183,9 +185,18 @@ static void secure_zero(void *ptr, size_t len) {
 // ─── OS Entropy ───────────────────────────────────────────────────────────────
 
 static void get_random_bytes(uint8_t *buf, size_t len) {
-  std::random_device rd;
-  for (size_t i = 0; i < len; ++i)
-    buf[i] = static_cast<uint8_t>(rd());
+#ifndef _WIN32
+  ssize_t ret = getrandom(buf, len, 0);
+  if (ret < 0 || (size_t)ret != len) {
+    std::cerr << "Error: getrandom() failed — cannot generate secure random bytes.\n";
+    exit(1);
+  }
+#else
+  if (BCryptGenRandom(nullptr, buf, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    std::cerr << "Error: BCryptGenRandom() failed — cannot generate secure random bytes.\n";
+    exit(1);
+  }
+#endif
 }
 
 // ─── Passphrase Input ─────────────────────────────────────────────────────────
@@ -495,6 +506,18 @@ private:
   }
 };
 
+// ─── Endian helpers (explicit LE, portable) ────────────────────────────────────────────────
+
+static void store_le64(uint8_t *p, uint64_t v) {
+  for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8*i));
+}
+
+static uint64_t load_le64(const uint8_t *p) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8*i);
+  return v;
+}
+
 // ─── AAD construction ────────────────────────────────────────────────────────
 /**
  * Serialise the 41-byte header into a flat buffer for Poly1305 AAD input.
@@ -509,7 +532,7 @@ static void build_aad(uint8_t aad[HEADER_SIZE],
   memcpy(p, &VERSION, 1);        p += 1;
   memcpy(p, salt,  SALT_LEN);    p += SALT_LEN;
   memcpy(p, nonce, NONCE_LEN);   p += NONCE_LEN;
-  memcpy(p, &orig_size, 8);
+  store_le64(p, orig_size);
 }
 
 // ─── GPU resource bundle (RAII helper) ───────────────────────────────────────
@@ -657,7 +680,7 @@ static bool decrypt_file(const std::string &src, const std::string &dst,
   const uint8_t *salt  = aad + 5;
   const uint8_t *nonce = aad + 5 + SALT_LEN;
   uint64_t orig_size;
-  memcpy(&orig_size, aad + 5 + SALT_LEN + NONCE_LEN, 8);
+  orig_size = load_le64(aad + 5 + SALT_LEN + NONCE_LEN);
 
   if ((size_t)(total - HEADER_SIZE - TAG_LEN) < orig_size) {
     std::cerr << "Truncated ciphertext: " << src << "\n"; return false;
@@ -682,10 +705,11 @@ static bool decrypt_file(const std::string &src, const std::string &dst,
     t.read(reinterpret_cast<char*>(stored_tag), TAG_LEN);
   }
 
+  std::string tmp_dst = dst + ".tmp";
   std::ofstream out;
   if (!verify_only) {
-    out.open(dst, std::ios::binary);
-    if (!out) { std::cerr << "Cannot create: " << dst << "\n"; return false; }
+    out.open(tmp_dst, std::ios::binary);
+    if (!out) { std::cerr << "Cannot create: " << tmp_dst << "\n"; return false; }
   }
 
   uint32_t key32[8], nonce32[3];
@@ -723,7 +747,10 @@ static bool decrypt_file(const std::string &src, const std::string &dst,
     if (!verify_only) {
       out.write(reinterpret_cast<char*>(gpu.h_buf), (std::streamsize)read_bytes);
       if (!out.good()) {
-        std::cerr << "\nWrite error: " << dst << "\n"; return false;
+        std::cerr << "\nWrite error: " << tmp_dst << "\n";
+        out.close();
+        if (fs::exists(tmp_dst)) fs::remove(tmp_dst);
+        return false;
       }
     }
 
@@ -739,8 +766,10 @@ static bool decrypt_file(const std::string &src, const std::string &dst,
   if (!ct_equal(computed_tag, stored_tag, TAG_LEN)) {
     std::cerr << "Authentication FAILED — wrong passphrase or tampered file:\n"
               << "  " << src << "\n";
-    // Remove partial output so corrupt plaintext never reaches disk
-    if (!verify_only && fs::exists(dst)) fs::remove(dst);
+    if (!verify_only) {
+      out.close();
+      if (fs::exists(tmp_dst)) fs::remove(tmp_dst);
+    }
     secure_zero(otk, 32);
     return false;
   }
@@ -751,6 +780,7 @@ static bool decrypt_file(const std::string &src, const std::string &dst,
     std::cerr << "MAC OK  (verify only) — " << src << "\n";
   } else {
     out.close();
+    fs::rename(tmp_dst, dst);
     std::cerr << "Decrypted -> " << dst << "  (" << orig_size << " bytes)\n";
   }
   return true;
@@ -867,7 +897,9 @@ int main(int argc, char *argv[]) {
     g_chunk_bytes = choose_chunk_size(chunk_mb * 1024 * 1024);
     std::string pass = read_passphrase("Passphrase: ");
     if (pass.empty()) { std::cerr << "Empty passphrase.\n"; return 1; }
-    return decrypt_file(target, "", pass, /*verify_only=*/true) ? 0 : 1;
+    bool ok = decrypt_file(target, "", pass, /*verify_only=*/true);
+    secure_zero(pass.data(), pass.size());
+    return ok ? 0 : 1;
   }
 
   if (mode != "encrypt" && mode != "decrypt") { usage(argv[0]); return 1; }
@@ -879,21 +911,26 @@ int main(int argc, char *argv[]) {
   if (pass.empty()) { std::cerr << "Empty passphrase.\n"; return 1; }
 
   bool encrypting = (mode == "encrypt");
+  bool ok;
 
   // ── directory ───────────────────────────────────────────────────────────────
   if (recursive || fs::is_directory(target)) {
-    return process_directory(target, encrypting, pass) ? 0 : 1;
+    ok = process_directory(target, encrypting, pass);
+    secure_zero(pass.data(), pass.size());
+    return ok ? 0 : 1;
   }
 
   // ── single file ─────────────────────────────────────────────────────────────
   if (encrypting) {
-    return encrypt_file(target, target + ".enc", pass) ? 0 : 1;
+    ok = encrypt_file(target, target + ".enc", pass);
   } else {
     std::string dst;
     if (target.size() > 4 && target.substr(target.size()-4) == ".enc")
       dst = target.substr(0, target.size()-4);
     else
       dst = "decrypted_" + target;
-    return decrypt_file(target, dst, pass) ? 0 : 1;
+    ok = decrypt_file(target, dst, pass);
   }
+  secure_zero(pass.data(), pass.size());
+  return ok ? 0 : 1;
 }
