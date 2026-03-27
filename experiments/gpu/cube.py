@@ -1,7 +1,29 @@
-import pyray as pr
-import numpy as np
+import sys
+import subprocess
 import math
 from typing import List, Tuple, Any
+
+def ensure_package(pkg_name, import_name=None):
+    """
+    Try to import a package. If missing, install it via pip.
+    pkg_name: the name used in pip install
+    import_name: the name used in import (defaults to pkg_name)
+    """
+    if import_name is None:
+        import_name = pkg_name
+    try:
+        __import__(import_name)
+    except ImportError:
+        print(f"Package '{import_name}' not found. Installing {pkg_name}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name])
+        globals()[import_name] = __import__(import_name)
+
+# --- Ensure dependencies ---
+ensure_package("numpy")
+ensure_package("numba")
+ensure_package("torch")
+ensure_package("raylib-py", "raylibpy")  # pip name vs import name mismatch
+
 
 # -- CONFIGURATION & RENDERING PARAMETERS --
 WIDTH, HEIGHT = 640, 512
@@ -306,7 +328,13 @@ def main() -> None:
             face_color = pr.Color(r, g, b, 255)
             edge_color = pr.Color(min(255, r + 50), min(255, g + 50), min(255, b + 50), 255)
 
-            pr.draw_triangle_fan(points, len(points), face_color)
+            # Convert list of Vector2 into a ctypes array
+
+            # Convert Python list into a ctypes array of Vector2
+            points_array = (pr.Vector2 * len(points))(*points)
+
+            pr.draw_triangle_fan(points_array, len(points), face_color)
+
             for j in range(len(points)):
                 pr.draw_line_v(points[j], points[(j+1)%len(points)], edge_color)
 
