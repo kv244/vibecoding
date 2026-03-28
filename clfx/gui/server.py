@@ -1,5 +1,6 @@
 import os
 import subprocess
+import threading
 import uuid
 import time
 import platform as pf
@@ -23,7 +24,7 @@ ENGINE_PATH = os.path.join(ROOT_DIR, 'clfx.exe' if _is_win else 'clfx')
 OUTPUT_DIR  = '/tmp/clfx_output'  if _is_cloud else os.path.join(GUI_DIR, 'output')
 UPLOADS_DIR = '/tmp/clfx_uploads' if _is_cloud else os.path.join(GUI_DIR, 'uploads')
 
-GUI_VERSION = "1.0.2"
+GUI_VERSION = "1.1.0"
 
 VALID_EFFECTS = {
     'gain', 'pan', 'eq', 'lowpass', 'distortion', 'bitcrush', 'compress', 'gate',
@@ -38,12 +39,104 @@ def sanitize_path(path, base_dir):
     """Ensure path is within base_dir and normalized."""
     if not path:
         return None
-    # Join and resolve
     full_path = os.path.realpath(os.path.join(base_dir, path))
-    # Check if full_path starts with base_dir (jail check)
     if not full_path.startswith(os.path.realpath(base_dir)):
         return None
     return full_path
+
+# ── Persistent daemon worker ─────────────────────────────────────────────────
+
+class ClfxWorker:
+    """Wraps the clfx --daemon subprocess.
+
+    Keeps OpenCL context alive across requests so platform/device/program
+    initialisation only happens once per container instance.  A threading.Lock
+    serialises jobs: Cloud Run scales by adding containers, not threads.
+    """
+
+    def __init__(self):
+        self._proc = None
+        self._lock = threading.Lock()
+        self._start()
+
+    def _start(self):
+        try:
+            self._proc = subprocess.Popen(
+                [ENGINE_PATH, '--daemon'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,     # inherit server stderr so logs appear in Cloud Run
+                cwd=ROOT_DIR,
+                text=True,
+                bufsize=1        # line-buffered
+            )
+            print(f"[worker] Daemon PID {self._proc.pid} started", flush=True)
+        except Exception as e:
+            print(f"[worker] Failed to start daemon: {e}", flush=True)
+            self._proc = None
+
+    def _ensure_alive(self):
+        if self._proc is None or self._proc.poll() is not None:
+            print("[worker] Daemon exited — restarting", flush=True)
+            self._start()
+
+    def _read_response(self, timeout=120):
+        """Read one response line with a timeout."""
+        import select, sys
+        if _is_win:
+            # select() doesn't work on Windows pipes; use a thread with timeout
+            result = [None]
+            def reader():
+                try:
+                    result[0] = self._proc.stdout.readline()
+                except Exception:
+                    pass
+            t = threading.Thread(target=reader, daemon=True)
+            t.start()
+            t.join(timeout)
+            return result[0]
+        else:
+            rlist, _, _ = select.select([self._proc.stdout], [], [], timeout)
+            if rlist:
+                return self._proc.stdout.readline()
+            return None
+
+    def process(self, args: list, timeout=120):
+        """Send a job to the daemon and return (success, message).
+
+        args = [input_path, output_path, effect, param, ...]
+        """
+        with self._lock:
+            self._ensure_alive()
+            if self._proc is None:
+                return False, "Engine daemon not available"
+
+            try:
+                msg = f"{len(args)}\n" + "\n".join(args) + "\n"
+                self._proc.stdin.write(msg)
+                self._proc.stdin.flush()
+            except Exception as e:
+                return False, f"Failed to write to daemon: {e}"
+
+            line = self._read_response(timeout)
+            if not line:
+                # Daemon timed out or died
+                self._proc = None
+                return False, "Daemon timed out or died"
+
+            line = line.rstrip('\n')
+            if line == "OK":
+                return True, ""
+            elif line.startswith("ERR: "):
+                return False, line[5:]
+            else:
+                return False, f"Unexpected daemon response: {line!r}"
+
+
+# One worker per gunicorn worker process (Cloud Run: 1 worker = 1 container)
+_worker = ClfxWorker()
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -52,16 +145,12 @@ def upload_file():
     file = request.files['file']
     if file.filename == '':
         return jsonify({"success": False, "error": "No selected file"}), 400
-    
+
     if file and file.filename.lower().endswith('.wav'):
-        # Add random prefix to prevent collisions
         safe_filename = f"{uuid.uuid4().hex[:8]}_{os.path.basename(file.filename)}"
         save_path = os.path.join(UPLOADS_DIR, safe_filename)
         file.save(save_path)
 
-        # Validate WAV is 16-bit PCM (engine requirement)
-        # NOTE: all os.remove() calls must happen AFTER the `with` block so
-        #       the file handle is closed first (Windows does not allow deleting open files).
         bits, ch, wav_err = None, None, None
         frames, fs, duration = None, None, None
         try:
@@ -95,20 +184,18 @@ def upload_file():
                 "error": f"Engine requires 16-bit PCM WAV, but this file is {bits}-bit. "
                          f"Convert with: ffmpeg -i input.wav -acodec pcm_s16le -ar 44100 output.wav"}), 400
 
-
         info_str = f"Loaded: {ch}ch 16-bit PCM"
         if duration is not None:
             info_str = f"{ch}ch · {fs}Hz · {duration}s"
 
         return jsonify({
-            "success": True, 
+            "success": True,
             "filename": safe_filename,
             "info": info_str,
             "sample_rate": fs,
             "duration": duration,
             "channels": ch
         })
-
 
     return jsonify({"success": False, "error": "Only WAV files allowed"}), 400
 
@@ -118,13 +205,11 @@ def index():
 
 @app.route('/download/<filename>', methods=['GET'])
 def download_file(filename):
-    # Ensure we only serve from the output directory
     filename = os.path.basename(filename)
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
 @app.route('/uploads/<filename>', methods=['GET'])
 def get_upload_file(filename):
-    # Serve original uploaded files for browser playback and visualization
     filename = os.path.basename(filename)
     return send_from_directory(UPLOADS_DIR, filename)
 
@@ -137,13 +222,9 @@ def get_system_info():
         "engine_version": "Unknown",
         "engine": "Unknown"
     }
-
-    
     try:
-        # Run engine with --info
         result = subprocess.run([ENGINE_PATH, '--info'], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
-            # Parse engine output for relevant lines
             lines = result.stdout.split('\n')
             engine_details = []
             for line in lines:
@@ -155,7 +236,7 @@ def get_system_info():
                 info["engine"] = engine_details
     except Exception as e:
         info["engine"] = f"Probe failed: {str(e)}"
-        
+
     return jsonify(info)
 
 @app.route('/process', methods=['POST'])
@@ -164,111 +245,82 @@ def process():
     input_file_raw = data.get('inputFile')
     effects = data.get('effects', [])
     output_name_raw = data.get('outputName', 'processed.wav')
-    
+
     try:
         global_mix = float(data.get('mix', 1.0))
     except (ValueError, TypeError):
         return jsonify({"error": "Invalid mix value"}), 400
 
-    # 1. Sanitize Paths - Prioritize UPLOADS_DIR
+    # 1. Sanitize input path
     full_input_path = sanitize_path(input_file_raw, UPLOADS_DIR)
     if not full_input_path or not os.path.exists(full_input_path):
         full_input_path = sanitize_path(input_file_raw, ROOT_DIR)
-    
     if not full_input_path or not os.path.exists(full_input_path):
         return jsonify({"error": f"Input file not found: {input_file_raw}"}), 400
 
-    # Ensure output name is just a filename, or sanitize it within OUTPUT_DIR
-    output_filename = os.path.basename(output_name_raw)
-    if not output_filename.endswith('.wav'):
-        output_filename += '.wav'
+    # 2. UUID-prefixed output filename (prevents race conditions under concurrency)
+    output_basename = os.path.basename(output_name_raw)
+    if not output_basename.endswith('.wav'):
+        output_basename += '.wav'
+    output_filename = f"{uuid.uuid4().hex[:8]}_{output_basename}"
     full_output_path = os.path.join(OUTPUT_DIR, output_filename)
 
-    # 2. Build Command Line
-    cmd = [ENGINE_PATH, full_input_path, full_output_path]
+    # 3. Build args list for the daemon
+    args = [full_input_path, full_output_path]
 
     for fx in effects:
         fx_type = fx.get('type')
-        if not fx_type: continue
-        
-        # Whitelist validation
+        if not fx_type:
+            continue
         if fx_type not in VALID_EFFECTS:
             return jsonify({"error": f"Unknown or restricted effect: {fx_type}"}), 400
-        
-        cmd.append(fx_type)
-        
+
+        args.append(fx_type)
+
         if fx_type == 'convolve':
             ir_raw = fx.get('ir')
-            # IR files can be in ROOT_DIR
             full_ir_path = sanitize_path(ir_raw, ROOT_DIR)
             if not full_ir_path:
                 return jsonify({"error": f"Invalid IR path: {ir_raw}"}), 400
-            cmd.append(full_ir_path)
+            args.append(full_ir_path)
         else:
             try:
-                if 'p1' in fx: cmd.append(str(float(fx['p1'])))
-                if 'p2' in fx: cmd.append(str(float(fx['p2'])))
+                if 'p1' in fx: args.append(str(float(fx['p1'])))
+                if 'p2' in fx: args.append(str(float(fx['p2'])))
             except (ValueError, TypeError):
                 return jsonify({"error": f"Invalid numeric parameter in {fx_type}"}), 400
 
-    # Apply master mix as a final gain stage if not at unity (engine has no --mix flag)
     if abs(global_mix - 1.0) > 0.01:
-        cmd.extend(['gain', str(global_mix)])
+        args.extend(['gain', str(global_mix)])
 
-    try:
-        print(f"Executing: {' '.join(cmd)}")
-        # Run engine from project root with timeout to prevent hanging
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT_DIR, timeout=120)
-        
-        if result.returncode == 0:
-            # Generate visualization
-            # visualize.py is in root, needs path to output relative to root
-            rel_output_path = os.path.relpath(full_output_path, ROOT_DIR)
-            viz_cmd = ['python', 'visualize.py', rel_output_path]
-            try:
-                viz_result = subprocess.run(viz_cmd, capture_output=True, text=True, cwd=ROOT_DIR, timeout=30)
-                if viz_result.returncode != 0:
-                    print(f"Visualization failed: {viz_result.stderr}")
-            except subprocess.TimeoutExpired:
-                print("Visualization timed out")
+    if len(args) < 3:
+        return jsonify({"error": "No effects specified"}), 400
 
-            # Move waveform.png to output if it's in the root
-            root_waveform = os.path.join(ROOT_DIR, 'waveform.png')
-            if os.path.exists(root_waveform):
-                target_waveform = os.path.join(OUTPUT_DIR, 'waveform.png')
-                if os.path.exists(target_waveform):
-                    os.remove(target_waveform)
-                os.rename(root_waveform, target_waveform)
+    print(f"[process] args: {args}", flush=True)
 
-            return jsonify({
-                "success": True, 
-                "output": output_filename,
-                "waveform": "output/waveform.png",
-                "audio": f"output/{output_filename}",
-                "stdout": result.stdout
-            })
-        else:
-            diag = f"Exit code {result.returncode}"
-            if result.stderr.strip(): diag += f" | stderr: {result.stderr.strip()}"
-            if result.stdout.strip(): diag += f" | stdout: {result.stdout.strip()}"
-            if not result.stderr.strip() and not result.stdout.strip():
-                diag += " | No output — engine binary may be missing or not compiled for this platform."
-            return jsonify({
-                "success": False,
-                "error": diag,
-                "cmd": ' '.join(cmd)
-            }), 500
-    except subprocess.TimeoutExpired:
-        return jsonify({"success": False, "error": "Processing timed out after 120 seconds"}), 504
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    # 4. Dispatch to persistent daemon
+    success, errmsg = _worker.process(args, timeout=120)
+
+    if success:
+        return jsonify({
+            "success": True,
+            "output": output_filename,
+            "audio": f"output/{output_filename}",
+            "stdout": ""
+        })
+    else:
+        return jsonify({
+            "success": False,
+            "error": errmsg or "Processing failed",
+            "cmd": ' '.join(args)
+        }), 500
 
 @app.route('/visualize', methods=['POST'])
 def visualize():
     """Read a WAV file from output dir and return downsampled peak data for browser canvas rendering."""
     data = request.json
     filename = data.get('file', '')
-    filename = os.path.basename(filename)  # Safety: strip paths
+    filename = os.path.basename(filename)
     full_path = os.path.join(OUTPUT_DIR, filename)
 
     if not os.path.exists(full_path):
@@ -287,7 +339,6 @@ def visualize():
         fmt = f"<{frames * channels}h"
         samples = struct.unpack(fmt, raw)
 
-        # Downsample to ~1000 peak blocks for canvas
         NUM_BLOCKS = 1000
         samples_per_block = max(1, len(samples) // (NUM_BLOCKS * channels))
         peaks_l, peaks_r = [], []
@@ -315,6 +366,5 @@ def static_files(path):
 
 if __name__ == '__main__':
     is_debug = os.environ.get('DEBUG', 'false').lower() == 'true'
-    print(f"CLFX Dashboard starting (debug={is_debug}) at http://localhost:5000")
+    print(f"CLFX Dashboard v{GUI_VERSION} (debug={is_debug}) at http://localhost:5000")
     app.run(port=5000, debug=is_debug)
-

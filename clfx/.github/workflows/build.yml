@@ -56,6 +56,14 @@ jobs:
     - name: Verify Linux Outputs Generated
       run: ls -lh out_*.wav
 
+    - name: Test Daemon Mode
+      run: |
+        # Start daemon, send one job, verify OK response
+        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>/dev/null)
+        echo "Daemon response: '$RESPONSE'"
+        [ "$RESPONSE" = "OK" ] || { echo "FAIL: expected OK, got: $RESPONSE"; exit 1; }
+        ls -lh daemon_out.wav
+
     - name: Upload Linux Binary
       uses: actions/upload-artifact@v4
       with:

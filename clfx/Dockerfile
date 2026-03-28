@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY main.c .
+COPY kernel.cl .
 COPY include/ include/
 
 # Compile to a standalone Linux binary (no Cygwin, no Windows deps)
@@ -31,9 +32,14 @@ WORKDIR /app
 COPY --from=builder /build/clfx ./clfx
 RUN chmod +x clfx
 
+# kernel.cl must be present at runtime: the engine loads it on every --daemon start
+COPY kernel.cl .
+
+# Default IR for convolution reverb effect
+COPY ir.wav .
+
 # Copy GUI source
 COPY gui/ gui/
-COPY visualize.py .
 
 # Install Python dependencies
 RUN pip3 install --no-cache-dir flask gunicorn
@@ -41,10 +47,12 @@ RUN pip3 install --no-cache-dir flask gunicorn
 # Cloud Run injects PORT env var (default 8080)
 ENV PORT=8080
 
-# Two workers: one for audio processing (slow), one for GUI requests
+# One gunicorn worker per container.
+# The worker spawns one clfx --daemon subprocess that keeps OpenCL alive.
+# Cloud Run scales horizontally (more containers) rather than vertically.
 CMD exec gunicorn \
       --bind "0.0.0.0:${PORT}" \
       --timeout 300 \
-      --workers 2 \
+      --workers 1 \
       --log-level info \
       "gui.server:app"

@@ -184,7 +184,451 @@ int is_effect_name(const char *name) {
   return 0;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Daemon Mode  (clfx --daemon)
+//
+// Protocol  (text over stdin / stdout):
+//   Python → C  : "<N>\n<arg0>\n<arg1>\n...<argN-1>\n"
+//                 where arg0=input.wav, arg1=output.wav, arg2..=effects
+//   C → Python  : "OK\n"  or  "ERR: <message>\n"
+//   All diagnostics go to stderr so stdout stays clean for the protocol.
+// ─────────────────────────────────────────────────────────────────────────────
+
+typedef struct {
+    cl_device_id     device;
+    cl_context       context;
+    cl_command_queue queue;
+    cl_program       program;
+    cl_kernel        kernel;
+    size_t           preferred_wg_size;
+} ClfxEngine;
+
+static ClfxEngine g_engine;
+
+static int engine_init(void)
+{
+    cl_int  err;
+    cl_uint num_platforms;
+
+    err = clGetPlatformIDs(0, NULL, &num_platforms);
+    if (err != CL_SUCCESS || num_platforms == 0) {
+        fprintf(stderr, "[daemon] No OpenCL platforms found\n");
+        return -1;
+    }
+    cl_platform_id *plats = malloc(sizeof(cl_platform_id) * num_platforms);
+    if (!plats) return -1;
+    clGetPlatformIDs(num_platforms, plats, NULL);
+
+    int found = 0;
+    for (cl_uint i = 0; i < num_platforms && !found; i++) {
+        if (clGetDeviceIDs(plats[i], CL_DEVICE_TYPE_GPU, 1, &g_engine.device, NULL) == CL_SUCCESS)
+            found = 1;
+    }
+    if (!found) {
+        for (cl_uint i = 0; i < num_platforms && !found; i++) {
+            if (clGetDeviceIDs(plats[i], CL_DEVICE_TYPE_CPU, 1, &g_engine.device, NULL) == CL_SUCCESS)
+                found = 1;
+        }
+    }
+    free(plats);
+    if (!found) { fprintf(stderr, "[daemon] No OpenCL device found\n"); return -1; }
+
+    char dev_name[128] = {0};
+    clGetDeviceInfo(g_engine.device, CL_DEVICE_NAME, sizeof(dev_name), dev_name, NULL);
+    fprintf(stderr, "[daemon] Device: %s\n", dev_name);
+
+    g_engine.context = clCreateContext(NULL, 1, &g_engine.device, NULL, NULL, &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "[daemon] clCreateContext failed: %d\n", err); return -1; }
+
+    g_engine.queue = clCreateCommandQueueWithProperties(g_engine.context, g_engine.device, NULL, &err);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[daemon] clCreateCommandQueue failed: %d\n", err);
+        clReleaseContext(g_engine.context); return -1;
+    }
+
+    char *src = load_kernel_source("kernel.cl");
+    if (!src) { fprintf(stderr, "[daemon] Failed to load kernel.cl\n"); return -1; }
+
+    g_engine.program = clCreateProgramWithSource(g_engine.context, 1,
+                                                 (const char **)&src, NULL, &err);
+    free(src);
+    if (err != CL_SUCCESS) { fprintf(stderr, "[daemon] clCreateProgramWithSource failed\n"); return -1; }
+
+    /* Always compile with TILE_SIZE=256 — safe for all effects (spectral needs
+       256; non-spectral ignore the shared memory entirely).                   */
+    err = clBuildProgram(g_engine.program, 1, &g_engine.device, "-DTILE_SIZE=256", NULL, NULL);
+    if (err != CL_SUCCESS) {
+        size_t log_sz = 0;
+        clGetProgramBuildInfo(g_engine.program, g_engine.device,
+                              CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+        char *log = malloc(log_sz + 1);
+        if (log) {
+            clGetProgramBuildInfo(g_engine.program, g_engine.device,
+                                  CL_PROGRAM_BUILD_LOG, log_sz, log, NULL);
+            log[log_sz] = '\0';
+            fprintf(stderr, "[daemon] Build log: %s\n", log);
+            free(log);
+        }
+        return -1;
+    }
+
+    g_engine.kernel = clCreateKernel(g_engine.program, "apply_effects", &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "[daemon] clCreateKernel failed: %d\n", err); return -1; }
+
+    err = clGetKernelWorkGroupInfo(g_engine.kernel, g_engine.device,
+                                   CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                                   sizeof(size_t), &g_engine.preferred_wg_size, NULL);
+    if (err != CL_SUCCESS) g_engine.preferred_wg_size = 64;
+
+    fprintf(stderr, "[daemon] Engine ready (preferred_wg=%zu)\n", g_engine.preferred_wg_size);
+    return 0;
+}
+
+static void engine_destroy(void)
+{
+    if (g_engine.kernel)  clReleaseKernel(g_engine.kernel);
+    if (g_engine.program) clReleaseProgram(g_engine.program);
+    if (g_engine.queue)   clReleaseCommandQueue(g_engine.queue);
+    if (g_engine.context) clReleaseContext(g_engine.context);
+    memset(&g_engine, 0, sizeof(g_engine));
+}
+
+/* exec_job: process one audio job using the persistent engine.
+   argv[0] = input.wav path
+   argv[1] = output.wav path
+   argv[2..argc-1] = effect name [param1] [param2] ...
+   Returns 0 on success, -1 on error (message written to stderr).       */
+static int exec_job(int argc, char **argv)
+{
+    /* ── Variable declarations (all at top — required for goto safety) ───── */
+    int          ret = 0;
+    FILE        *fp = NULL, *out_fp = NULL;
+    int16_t     *raw_data = NULL;
+    float       *h_ir = NULL, *h_mapped = NULL;
+    cl_mem       d_in = NULL, d_out = NULL, d_ir = NULL, d_ir_dummy = NULL;
+    cl_mem       d_initial_in = NULL, d_initial_out = NULL;
+    cl_int       err;
+    char        *ir_filename = NULL;
+    int          num_effects = 0;
+    int          numSamples = 0, paddedSamples = 0, samplesTotal = 0, numChans = 0;
+    float        global_mix = 1.0f, sRate = 0.0f;
+    size_t       global_size = 0;
+    EffectConfig chain[MAX_EFFECTS];
+    WavHeader    header;
+
+    if (argc < 3) {
+        fprintf(stderr, "[job] Need: input.wav output.wav effect [params...]\n");
+        return -1;
+    }
+
+    /* ── Parse effect chain ─────────────────────────────────────────────── */
+    int arg_idx = 2;
+    while (arg_idx < argc && num_effects < MAX_EFFECTS) {
+        if (strcmp(argv[arg_idx], "--mix") == 0) {
+            if (arg_idx + 1 < argc) global_mix = (float)atof(argv[++arg_idx]);
+            arg_idx++; continue;
+        }
+        const char *effect_name = argv[arg_idx];
+        EffectConfig *cfg = &chain[num_effects];
+        cfg->type = -1; cfg->p1 = 0.0f; cfg->p2 = 0.0f; cfg->ir_file = NULL;
+
+#define _P1(def) (arg_idx+1 < argc && !is_effect_name(argv[arg_idx+1])) ? \
+                    (float)atof(argv[++arg_idx]) : (def)
+        if      (strcmp(effect_name,"gain")==0)       { cfg->type=0;  cfg->p1=_P1(1.0f); }
+        else if (strcmp(effect_name,"echo")==0)       { cfg->type=1;  cfg->p1=_P1(4410.f); cfg->p2=_P1(0.5f); }
+        else if (strcmp(effect_name,"lowpass")==0)    { cfg->type=2;  cfg->p1=_P1(0.5f); }
+        else if (strcmp(effect_name,"bitcrush")==0)   { cfg->type=3;  { float _b=_P1(8.f); cfg->p1=powf(2.0f,roundf(_b)); } }
+        else if (strcmp(effect_name,"tremolo")==0)    { cfg->type=4;  cfg->p1=_P1(5.0f); cfg->p2=_P1(0.5f); }
+        else if (strcmp(effect_name,"widening")==0)   { cfg->type=5;  cfg->p1=_P1(1.5f); }
+        else if (strcmp(effect_name,"pingpong")==0)   { cfg->type=6;  cfg->p1=_P1(8820.f); cfg->p2=_P1(0.5f); }
+        else if (strcmp(effect_name,"chorus")==0)     { cfg->type=7; }
+        else if (strcmp(effect_name,"autowah")==0)    { cfg->type=8;  cfg->p1=_P1(0.5f); cfg->p2=_P1(0.2f); }
+        else if (strcmp(effect_name,"distortion")==0) { cfg->type=9;  cfg->p1=_P1(2.0f); }
+        else if (strcmp(effect_name,"ringmod")==0)    { cfg->type=10; cfg->p1=_P1(440.f); }
+        else if (strcmp(effect_name,"pitch")==0)      { cfg->type=11; cfg->p1=_P1(1.5f); }
+        else if (strcmp(effect_name,"gate")==0)       { cfg->type=12; cfg->p1=_P1(0.1f); cfg->p2=_P1(0.0f); }
+        else if (strcmp(effect_name,"pan")==0)        { cfg->type=13; cfg->p1=_P1(0.0f); }
+        else if (strcmp(effect_name,"eq")==0)         { cfg->type=14; cfg->p1=_P1(0.5f); cfg->p2=_P1(1.0f); }
+        else if (strcmp(effect_name,"freeze")==0)     { cfg->type=15; cfg->p1=_P1(0.5f); cfg->p2=_P1(0.0f); }
+        else if (strcmp(effect_name,"convolve")==0)   { cfg->type=16; if (arg_idx+1<argc && !is_effect_name(argv[arg_idx+1])) cfg->ir_file=argv[++arg_idx]; }
+        else if (strcmp(effect_name,"compress")==0)   { cfg->type=17; cfg->p1=_P1(0.5f); cfg->p2=_P1(4.0f); }
+        else if (strcmp(effect_name,"reverb")==0)     { cfg->type=18; cfg->p1=_P1(0.6f); cfg->p2=_P1(0.5f); }
+        else if (strcmp(effect_name,"flange")==0)     { cfg->type=19; cfg->p1=_P1(0.5f); cfg->p2=_P1(0.7f); }
+        else if (strcmp(effect_name,"phase")==0)      { cfg->type=20; cfg->p1=_P1(0.5f); cfg->p2=_P1(0.2f); }
+        else { fprintf(stderr, "[job] Unknown effect: %s\n", effect_name); return -1; }
+#undef _P1
+
+        if (cfg->type != -1) num_effects++;
+        arg_idx++;
+    }
+    if (num_effects == 0) { fprintf(stderr, "[job] No effects specified\n"); return -1; }
+
+    /* ── Load input WAV ─────────────────────────────────────────────────── */
+    fp = fopen(argv[0], "rb");
+    if (!fp) { fprintf(stderr, "[job] Cannot open: %s\n", argv[0]); return -1; }
+    if (fread(&header, sizeof(WavHeader), 1, fp) != 1 ||
+        header.audioFormat != 1 || header.bitsPerSample != 16) {
+        fprintf(stderr, "[job] Invalid WAV (need 16-bit PCM)\n");
+        fclose(fp); return -1;
+    }
+    numSamples = (int)(header.subchunk2Size / sizeof(int16_t));
+    raw_data = malloc(header.subchunk2Size);
+    if (!raw_data || fread(raw_data, header.subchunk2Size, 1, fp) != 1) {
+        fprintf(stderr, "[job] Failed to read audio\n");
+        fclose(fp); free(raw_data); return -1;
+    }
+    fclose(fp); fp = NULL;
+
+    /* ── Allocate per-request GPU buffers ───────────────────────────────── */
+    /* Align to 256*4=1024 samples (covers spectral TILE_SIZE=256 × float4) */
+    paddedSamples = (int)(((numSamples + 1023) / 1024) * 1024);
+    d_in  = clCreateBuffer(g_engine.context,
+                           CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                           sizeof(float) * paddedSamples, NULL, &err);
+    d_out = clCreateBuffer(g_engine.context,
+                           CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                           sizeof(float) * paddedSamples, NULL, &err);
+    if (!d_in || !d_out) {
+        fprintf(stderr, "[job] clCreateBuffer failed: %d\n", err);
+        ret = -1; goto job_cleanup;
+    }
+    d_initial_in = d_in; d_initial_out = d_out;
+
+    h_mapped = (float *)clEnqueueMapBuffer(g_engine.queue, d_in, CL_TRUE, CL_MAP_WRITE,
+                                           0, sizeof(float) * paddedSamples,
+                                           0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[job] clEnqueueMapBuffer (write) failed: %d\n", err);
+        ret = -1; goto job_cleanup;
+    }
+    memset(h_mapped, 0, sizeof(float) * paddedSamples);
+    for (int i = 0; i < numSamples; i++) h_mapped[i] = raw_data[i] / 32768.0f;
+    clEnqueueUnmapMemObject(g_engine.queue, d_in, h_mapped, 0, NULL, NULL);
+    h_mapped = NULL;
+
+    /* ── IR / convolution handling ──────────────────────────────────────── */
+    for (int i = 0; i < num_effects; i++) {
+        if (chain[i].type == 16 && chain[i].ir_file) { ir_filename = chain[i].ir_file; break; }
+    }
+    if (ir_filename) {
+        char cache_name[256];
+        snprintf(cache_name, sizeof(cache_name), "%s.clir", ir_filename);
+        int cache_loaded = 0;
+        FILE *fcache = fopen(cache_name, "rb");
+        if (fcache) {
+            h_ir = (float *)port_aligned_alloc(sizeof(float) * 2048, 4096);
+            if (h_ir && fread(h_ir, sizeof(float), 2048, fcache) == 2048) {
+                cache_loaded = 1;
+            } else {
+                if (h_ir) { port_aligned_free(h_ir); h_ir = NULL; }
+            }
+            fclose(fcache);
+        }
+        if (!cache_loaded) {
+            FILE *fir = fopen(ir_filename, "rb");
+            if (!fir) {
+                fprintf(stderr, "[job] Cannot open IR: %s\n", ir_filename);
+                ret = -1; goto job_cleanup;
+            }
+            WavHeader ir_h;
+            if (fread(&ir_h, sizeof(WavHeader), 1, fir) != 1) {
+                fclose(fir); ret = -1; goto job_cleanup;
+            }
+            int ir_samples = (int)(ir_h.subchunk2Size / sizeof(int16_t));
+            if (ir_samples > 1024) ir_samples = 1024;
+            int16_t *ir_raw = malloc(ir_samples * sizeof(int16_t));
+            if (!ir_raw || fread(ir_raw, sizeof(int16_t), ir_samples, fir) != (size_t)ir_samples) {
+                free(ir_raw); fclose(fir); ret = -1; goto job_cleanup;
+            }
+            fclose(fir);
+            h_ir   = (float *)port_aligned_alloc(sizeof(float) * 2048, 4096);
+            float *real = malloc(sizeof(float) * 1024);
+            float *imag = malloc(sizeof(float) * 1024);
+            if (h_ir && real && imag) {
+                for (int i = 0; i < 1024; i++) {
+                    real[i] = (i < ir_samples) ? ir_raw[i] / 32768.0f : 0.0f;
+                    imag[i] = 0.0f;
+                }
+                host_fft(real, imag, 1024);
+                for (int i = 0; i < 1024; i++) { h_ir[i*2] = real[i]; h_ir[i*2+1] = imag[i]; }
+                fcache = fopen(cache_name, "wb");
+                if (fcache) { fwrite(h_ir, sizeof(float), 2048, fcache); fclose(fcache); }
+                cache_loaded = 1;
+            }
+            free(real); free(imag); free(ir_raw);
+        }
+        if (cache_loaded && h_ir) {
+            d_ir = clCreateBuffer(g_engine.context,
+                                  CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                  sizeof(float) * 2048, h_ir, &err);
+        }
+    }
+    {
+        float zero = 0.0f;
+        if (!d_ir) {
+            d_ir_dummy = clCreateBuffer(g_engine.context,
+                                        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        sizeof(float), &zero, &err);
+            err = clSetKernelArg(g_engine.kernel, 8, sizeof(cl_mem), &d_ir_dummy);
+        } else {
+            err = clSetKernelArg(g_engine.kernel, 8, sizeof(cl_mem), &d_ir);
+        }
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[job] clSetKernelArg(ir) failed: %d\n", err);
+            ret = -1; goto job_cleanup;
+        }
+    }
+
+    /* ── Kernel dispatch ────────────────────────────────────────────────── */
+    samplesTotal = paddedSamples;
+    sRate        = (float)header.sampleRate;
+    numChans     = (int)header.numChannels;
+    global_size  = (size_t)paddedSamples / 4;
+
+    err  = clSetKernelArg(g_engine.kernel, 5, sizeof(int),   &samplesTotal);
+    err |= clSetKernelArg(g_engine.kernel, 6, sizeof(float), &sRate);
+    err |= clSetKernelArg(g_engine.kernel, 7, sizeof(int),   &numChans);
+    err |= clSetKernelArg(g_engine.kernel, 9, sizeof(float), &global_mix);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[job] clSetKernelArg(common) failed: %d\n", err);
+        ret = -1; goto job_cleanup;
+    }
+
+    for (int i = 0; i < num_effects; i++) {
+        err  = clSetKernelArg(g_engine.kernel, 0, sizeof(cl_mem), &d_in);
+        err |= clSetKernelArg(g_engine.kernel, 1, sizeof(cl_mem), &d_out);
+        err |= clSetKernelArg(g_engine.kernel, 2, sizeof(int),    &chain[i].type);
+        err |= clSetKernelArg(g_engine.kernel, 3, sizeof(float),  &chain[i].p1);
+        err |= clSetKernelArg(g_engine.kernel, 4, sizeof(float),  &chain[i].p2);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[job] clSetKernelArg(fx) failed: %d\n", err);
+            ret = -1; goto job_cleanup;
+        }
+
+        /* Spectral effects (type>=14) require local_size==TILE_SIZE==256 */
+        size_t local_size  = (chain[i].type >= 14) ? 256 : g_engine.preferred_wg_size;
+        size_t cur_global  = global_size;
+        if (chain[i].type >= 14)
+            cur_global = ((cur_global + 255) / 256) * 256;
+
+        err = clEnqueueNDRangeKernel(g_engine.queue, g_engine.kernel, 1, NULL,
+                                     &cur_global, &local_size, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[job] clEnqueueNDRangeKernel failed: %d\n", err);
+            ret = -1; goto job_cleanup;
+        }
+
+        cl_mem tmp = d_in; d_in = d_out; d_out = tmp; /* ping-pong */
+    }
+
+    /* ── Read back result and write output WAV ──────────────────────────── */
+    h_mapped = (float *)clEnqueueMapBuffer(g_engine.queue, d_in, CL_TRUE, CL_MAP_READ,
+                                           0, sizeof(float) * numSamples,
+                                           0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[job] Final map failed: %d\n", err);
+        ret = -1; goto job_cleanup;
+    }
+    for (int i = 0; i < numSamples; i++) {
+        float s = h_mapped[i] * 32768.0f;
+        raw_data[i] = (int16_t)clamp(s, -32768.0f, 32767.0f);
+    }
+    clEnqueueUnmapMemObject(g_engine.queue, d_in, h_mapped, 0, NULL, NULL);
+    h_mapped = NULL;
+
+    out_fp = fopen(argv[1], "wb");
+    if (!out_fp) {
+        fprintf(stderr, "[job] Cannot write output: %s\n", argv[1]);
+        ret = -1; goto job_cleanup;
+    }
+    fwrite(&header, sizeof(WavHeader), 1, out_fp);
+    fwrite(raw_data, header.subchunk2Size, 1, out_fp);
+    fclose(out_fp); out_fp = NULL;
+    fprintf(stderr, "[job] OK: %s\n", argv[1]);
+
+job_cleanup:
+    if (fp)     fclose(fp);
+    if (out_fp) fclose(out_fp);
+    free(raw_data);
+    if (h_mapped && d_in)
+        clEnqueueUnmapMemObject(g_engine.queue, d_in, h_mapped, 0, NULL, NULL);
+    if (h_ir)          port_aligned_free(h_ir);
+    if (d_initial_in)  clReleaseMemObject(d_initial_in);
+    if (d_initial_out) clReleaseMemObject(d_initial_out);
+    if (d_ir)          clReleaseMemObject(d_ir);
+    if (d_ir_dummy)    clReleaseMemObject(d_ir_dummy);
+    return ret;
+}
+
+static void run_daemon(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered stdout for protocol */
+    fprintf(stderr, "[daemon] CLFX daemon v" CLFX_VERSION " ready\n");
+    fflush(stderr);
+
+    char line[4096];
+    while (fgets(line, sizeof(line), stdin)) {
+        int n = atoi(line);
+        if (n < 3 || n > 64) {
+            fprintf(stderr, "[daemon] Bad arg count: %d\n", n);
+            printf("ERR: Bad arg count\n");
+            fflush(stdout);
+            continue;
+        }
+
+        char **args = (char **)malloc((size_t)(n + 1) * sizeof(char *));
+        if (!args) { printf("ERR: OOM\n"); fflush(stdout); continue; }
+
+        int ok = 1;
+        int i;
+        for (i = 0; i < n; i++) {
+            args[i] = NULL;
+            if (!fgets(line, sizeof(line), stdin)) { ok = 0; break; }
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                line[--len] = '\0';
+            args[i] = strdup(line);
+            if (!args[i]) { ok = 0; break; }
+        }
+        args[n] = NULL;
+
+        if (!ok) {
+            for (i = 0; i < n; i++) free(args[i]);
+            free(args);
+            printf("ERR: Failed to read args\n");
+            fflush(stdout);
+            break; /* stdin broken — exit daemon */
+        }
+
+        int result = exec_job(n, args);
+        for (i = 0; i < n; i++) free(args[i]);
+        free(args);
+
+        if (result == 0)
+            printf("OK\n");
+        else
+            printf("ERR: Processing failed\n");
+        fflush(stdout);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 int main(int argc, char *argv[]) {
+  /* Daemon mode: must be detected before banner, variable declarations,
+     or any other processing.                                             */
+  for (int _i = 1; _i < argc; _i++) {
+    if (strcmp(argv[_i], "--daemon") == 0) {
+      if (engine_init() != 0) {
+        fprintf(stderr, "[daemon] Engine init failed\n");
+        return 1;
+      }
+      run_daemon();
+      engine_destroy();
+      return 0;
+    }
+  }
+
   printf("--- CLFX Audio Engine v%s ---\n", CLFX_VERSION);
   int ret = 0;
   FILE *fp = NULL, *out_fp = NULL;

@@ -5,7 +5,7 @@ REM
 REM  Requirements:
 REM    1. Install MSYS2 from https://www.msys2.org/  (default: C:\msys64)
 REM    2. Open MSYS2 MINGW64 shell and run:
-REM         pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-headers
+REM         pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-headers mingw-w64-x86_64-opencl-icd
 REM    3. Then run THIS script from any terminal.
 REM ──────────────────────────────────────────────────────────────────────────
 
