@@ -5,10 +5,12 @@ on:
     branches: [ main, master ]
     paths:
       - 'clfx/**'
+      - '.github/workflows/clfx-build.yml'
   pull_request:
     branches: [ main, master ]
     paths:
       - 'clfx/**'
+      - '.github/workflows/clfx-build.yml'
 
 defaults:
   run:
