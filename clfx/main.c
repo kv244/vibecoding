@@ -585,18 +585,22 @@ static void run_daemon(void)
             continue;
         }
 
+        fprintf(stderr, "[daemon] n=%d, allocating arg array\n", n); fflush(stderr);
         char **args = (char **)malloc((size_t)(n + 1) * sizeof(char *));
         if (!args) { printf("ERR: OOM\n"); fflush(stdout); continue; }
+        fprintf(stderr, "[daemon] arg array allocated\n"); fflush(stderr);
 
         int ok = 1;
         int i;
         for (i = 0; i < n; i++) {
             args[i] = NULL;
+            fprintf(stderr, "[daemon] reading arg[%d]\n", i); fflush(stderr);
             if (!fgets(line, sizeof(line), stdin)) { ok = 0; break; }
             size_t len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                 line[--len] = '\0';
             if (len > 4096) { ok = 0; break; } /* guard against truncated fgets lines */
+            fprintf(stderr, "[daemon] arg[%d]='%s' len=%zu\n", i, line, len); fflush(stderr);
             args[i] = strdup(line);
             if (!args[i]) { ok = 0; break; }
         }
