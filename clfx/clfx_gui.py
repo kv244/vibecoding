@@ -8,6 +8,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
+if os.name == 'nt':
+    import winsound
+
 class CLFXGUI:
     def __init__(self, root):
         self.root = root
@@ -45,6 +48,9 @@ class CLFXGUI:
 
         # Store original input waveform path for redrawing
         self._input_waveform_path = None
+        # Track the last successfully processed output file for Play
+        self._last_processed_path = None
+        self._playback_thread = None
 
         # GUI setup
         self.setup_ui()
@@ -80,14 +86,15 @@ class CLFXGUI:
 
         # Effect chain section
         effect_frame = ttk.LabelFrame(main_frame, text="Effect Chain", padding="10")
-        effect_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        effect_frame.pack(fill=tk.X, pady=5)
 
         # Effect list
         list_frame = ttk.Frame(effect_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
+        list_frame.pack(fill=tk.X)
 
-        self.effect_listbox = tk.Listbox(list_frame, height=10)
-        self.effect_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.effect_listbox = tk.Listbox(list_frame, height=6)
+        self.effect_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.effect_listbox.bind('<<ListboxSelect>>', lambda e: self.update_param_frame())
 
         scrollbar = ttk.Scrollbar(list_frame, command=self.effect_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -116,19 +123,20 @@ class CLFXGUI:
         process_frame.pack(fill=tk.X, pady=5)
         ttk.Button(process_frame, text="Process", command=self.process).pack(side=tk.LEFT, padx=5)
         ttk.Button(process_frame, text="Play", command=self.play_output).pack(side=tk.LEFT, padx=5)
+        ttk.Button(process_frame, text="Stop", command=self.stop_playback).pack(side=tk.LEFT, padx=5)
 
         # Status/log area
         log_frame = ttk.LabelFrame(main_frame, text="Status/Log", padding="10")
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        log_frame.pack(fill=tk.X, pady=5)
 
-        self.log_text = ScrolledText(log_frame, height=10)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text = ScrolledText(log_frame, height=5)
+        self.log_text.pack(fill=tk.X)
 
-        # Waveform preview
+        # Waveform preview — fixed height so it's always visible
         preview_frame = ttk.LabelFrame(main_frame, text="Waveform Preview", padding="10")
-        preview_frame.pack(fill=tk.BOTH, expand=True)
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
-        self.preview_canvas = tk.Canvas(preview_frame, bg="white")
+        self.preview_canvas = tk.Canvas(preview_frame, bg="white", height=120)
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
 
         # Tooltips
@@ -216,22 +224,33 @@ class CLFXGUI:
             messagebox.showerror("Error", f"Failed to get engine info: {str(e)}")
 
     def play_output(self):
-        output_path = self.output_path.get()
+        output_path = self._last_processed_path or self.output_path.get()
         if not output_path:
-            messagebox.showerror("Error", "No output file selected")
+            messagebox.showerror("Error", "No processed file available. Run Process first.")
             return
         if not os.path.exists(output_path):
-            messagebox.showerror("Error", "Output file does not exist. Process the file first.")
+            messagebox.showerror("Error", "Processed file not found. Run Process first.")
             return
-        try:
-            if os.name == 'nt':
-                os.startfile(output_path)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', output_path])
-            else:
-                subprocess.Popen(['xdg-open', output_path])
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to play file: {str(e)}")
+        self.stop_playback()  # stop any current playback first
+        if os.name == 'nt':
+            def _play():
+                try:
+                    winsound.PlaySound(output_path, winsound.SND_FILENAME)
+                except Exception:
+                    pass
+            self._playback_thread = threading.Thread(target=_play, daemon=True)
+            self._playback_thread.start()
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['afplay', output_path])
+        else:
+            subprocess.Popen(['aplay', output_path])
+
+    def stop_playback(self):
+        if os.name == 'nt':
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
 
     def show_tooltip(self, event, text):
         self.tooltip = tk.Toplevel(self.root)
@@ -387,46 +406,72 @@ class CLFXGUI:
         effect_name = parts[0]
         params = self.effects[effect_name]["params"]
 
-        if params:
-            param_frame = ttk.Frame(self.param_frame)
-            param_frame.pack(fill=tk.X, pady=2)
+        # Header: show which effect is selected and its index
+        idx = selection[0]
+        header = ttk.Label(
+            self.param_frame,
+            text=f"Parameters — [{idx + 1}] {effect_name}",
+            font=("", 9, "bold")
+        )
+        header.pack(anchor=tk.W, pady=(2, 4))
 
-            entries = []
-            for i, param in enumerate(params):
-                if len(param) == 1:
-                    param_name = param[0]
-                    min_val = max_val = default = None
-                else:
-                    param_name, min_val, max_val, default = param
+        if not params:
+            ttk.Label(self.param_frame, text="(no parameters)", foreground="grey").pack(anchor=tk.W)
+            return
 
-                frame = ttk.Frame(param_frame)
-                frame.pack(fill=tk.X, pady=2)
+        param_frame = ttk.Frame(self.param_frame)
+        param_frame.pack(fill=tk.X, pady=2)
 
-                label = ttk.Label(frame, text=f"{param_name}:", width=15)
-                label.pack(side=tk.LEFT)
+        entries = []
+        for i, param in enumerate(params):
+            if len(param) == 1:
+                param_name = param[0]
+                min_val = max_val = default = None
+            else:
+                param_name, min_val, max_val, default = param
 
-                if param_name == "ir_file":
-                    entry = ttk.Entry(frame, width=40)
-                    entry.pack(side=tk.LEFT, expand=True, fill=tk.X)
-                    button = ttk.Button(frame, text="Browse...", command=lambda e=entry: self.browse_ir(e))
-                    button.pack(side=tk.LEFT, padx=5)
-                else:
-                    entry = ttk.Spinbox(frame, from_=min_val, to=max_val, increment=(max_val-min_val)/100, width=10)
-                    entry.set(default)
-                    entry.pack(side=tk.LEFT)
+            frame = ttk.Frame(param_frame)
+            frame.pack(fill=tk.X, pady=2)
 
-                entries.append((param_name, entry))
+            label = ttk.Label(frame, text=f"{param_name}:", width=15)
+            label.pack(side=tk.LEFT)
 
-            if len(parts) > 1:
-                param_values = parts[1:]
-                for (param_name, entry), value in zip(entries, param_values):
-                    try:
-                        entry.delete(0, tk.END)
-                        entry.insert(0, value)
-                    except Exception:
-                        pass
+            if param_name == "ir_file":
+                entry = ttk.Entry(frame, width=40)
+                entry.pack(side=tk.LEFT, expand=True, fill=tk.X)
+                button = ttk.Button(frame, text="Browse...", command=lambda e=entry: self.browse_ir(e))
+                button.pack(side=tk.LEFT, padx=5)
+            else:
+                entry = ttk.Spinbox(frame, from_=min_val, to=max_val, increment=(max_val-min_val)/100, width=10)
+                entry.set(default)
+                entry.pack(side=tk.LEFT)
 
-            param_frame.entries = entries
+            entries.append((param_name, entry))
+
+        if len(parts) > 1:
+            param_values = parts[1:]
+            for (param_name, entry), value in zip(entries, param_values):
+                try:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, value)
+                except Exception:
+                    pass
+
+        param_frame.entries = entries
+
+        # Apply button writes current spinbox values back to the listbox entry
+        def apply_params(eff_name=effect_name, ent_list=entries, sel_idx=idx):
+            new_str = eff_name
+            vals = [e.get() for _, e in ent_list]
+            if vals:
+                new_str += " " + " ".join(vals)
+            self.effect_listbox.delete(sel_idx)
+            self.effect_listbox.insert(sel_idx, new_str)
+            self.effect_listbox.selection_set(sel_idx)
+
+        ttk.Button(self.param_frame, text="Apply Params", command=apply_params).pack(
+            anchor=tk.W, pady=(4, 0)
+        )
 
     def get_effect_chain(self):
         return [self.effect_listbox.get(i) for i in range(self.effect_listbox.size())]
@@ -464,17 +509,22 @@ class CLFXGUI:
                 if not self.daemon or self.daemon.poll() is not None:
                     self.start_daemon()
 
-            args = [input_path, output_path]
-            for effect in effects:
-                args.extend(effect.split())
+                if self.daemon is None:
+                    raise RuntimeError("clfx daemon could not be started")
 
-            lines = [str(len(args))] + args
-            payload = "\n".join(lines) + "\n"
-            self.daemon.stdin.write(payload)
-            self.daemon.stdin.flush()
+                args = [input_path, output_path]
+                for effect in effects:
+                    args.extend(effect.split())
 
-            response = self.daemon.stdout.readline().strip()
+                lines = [str(len(args))] + args
+                payload = "\n".join(lines) + "\n"
+                self.daemon.stdin.write(payload)
+                self.daemon.stdin.flush()
+
+                response = self.daemon.stdout.readline().strip()
+
             if response == "OK":
+                self._last_processed_path = output_path  # track what was actually written
                 self.root.after(0, lambda: self.log_text.insert(tk.END, "Processing completed successfully!\n"))
                 self.root.after(0, lambda: self.log_text.see(tk.END))
                 self.root.after(0, self.update_waveform, output_path)
@@ -540,8 +590,12 @@ class CLFXGUI:
 
             samples = struct.unpack(fmt, frames_data)
 
-            canvas_width = self.preview_canvas.winfo_width() or 800
-            canvas_height = self.preview_canvas.winfo_height() or 150
+            canvas_width = self.preview_canvas.winfo_width()
+            canvas_height = self.preview_canvas.winfo_height()
+            if canvas_width < 10:
+                canvas_width = 800
+            if canvas_height < 10:
+                canvas_height = 120
             center = canvas_height // 2
 
             self.preview_canvas.delete("all")

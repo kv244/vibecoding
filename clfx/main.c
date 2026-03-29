@@ -522,8 +522,9 @@ static int exec_job(int argc, char **argv)
     }
 
     /* ── Read back result and write output WAV ──────────────────────────── */
+    /* Map the full padded buffer (kernel may have written beyond numSamples) */
     h_mapped = (float *)clEnqueueMapBuffer(g_engine.queue, d_in, CL_TRUE, CL_MAP_READ,
-                                           0, sizeof(float) * numSamples,
+                                           0, sizeof(float) * paddedSamples,
                                            0, NULL, NULL, &err);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[job] Final map failed: %d\n", err);
@@ -587,6 +588,7 @@ static void run_daemon(void)
             size_t len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                 line[--len] = '\0';
+            if (len > 4096) { ok = 0; break; } /* guard against truncated fgets lines */
             args[i] = strdup(line);
             if (!args[i]) { ok = 0; break; }
         }
