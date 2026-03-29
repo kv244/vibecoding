@@ -26,11 +26,15 @@ __kernel void apply_effects(__global const float4* input,
     __local float4 tile[TILE_SIZE + 2]; // Defined via compiler -D flag
 
     // --- FFT Shared Memory ---
-    // For n=1024, if wg=256, we can handle it.
-    // However, if wg is dynamic, we need to be careful.
-    // Let's assume n = wg * 4 (since float4)
-    __local float2 fft_data[1024]; 
-    __local float2 fft_scratch[1024]; // Used for safe bit-reversal and IR FFT
+    // Spectral effects (type 14-16) require TILE_SIZE=256 work-items and
+    // process a 1024-sample block per work-group (256 × float4 = 1024 floats).
+    // On pocl/CPU __local is allocated on the host stack per work-group; keeping
+    // these arrays at exactly 1024 elements minimises peak stack pressure.
+    // Non-spectral effects never touch these arrays but they are still allocated;
+    // if local memory pressure is too high for a given device, dispatch spectral
+    // effects with a separate clSetKernelArg that passes NULL for these.
+    __local float2 fft_data[1024];
+    __local float2 fft_scratch[1024];
 
     // Each work-item processes 4 samples
     if (gid * 4 >= num_samples) return;

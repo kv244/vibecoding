@@ -574,7 +574,15 @@ static void run_daemon(void)
     fprintf(stderr, "[daemon] CLFX daemon v" CLFX_VERSION " ready\n");
     fflush(stderr);
 
-    char line[4096];
+    /* Use stack-allocated arg storage to avoid heap races with pocl's
+       background LLVM JIT threads that are active during clBuildProgram.
+       MAX_ARGS=66 (64 args + sentinel), MAX_ARG_LEN=4096 per arg.       */
+    #define MAX_ARGS    66
+    #define MAX_ARG_LEN 4096
+    char arg_store[MAX_ARGS][MAX_ARG_LEN + 1];
+    char *args[MAX_ARGS];
+    char line[MAX_ARG_LEN + 1];
+
     while (fgets(line, sizeof(line), stdin)) {
         int n = atoi(line);
         if (n < 3 || n > 64) {
@@ -584,40 +592,32 @@ static void run_daemon(void)
             continue;
         }
 
-        char **args = (char **)malloc((size_t)(n + 1) * sizeof(char *));
-        if (!args) { printf("ERR: OOM\n"); fflush(stdout); continue; }
-
         int ok = 1;
         int i;
         for (i = 0; i < n; i++) {
-            args[i] = NULL;
             if (!fgets(line, sizeof(line), stdin)) { ok = 0; break; }
             size_t len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                 line[--len] = '\0';
-            if (len > 4096) { ok = 0; break; } /* guard against truncated fgets lines */
-            args[i] = strdup(line);
-            if (!args[i]) { ok = 0; break; }
+            if (len > MAX_ARG_LEN) { ok = 0; break; }
+            memcpy(arg_store[i], line, len + 1);
+            args[i] = arg_store[i];
         }
         args[n] = NULL;
 
         if (!ok) {
-            for (i = 0; i < n; i++) free(args[i]);
-            free(args);
             printf("ERR: Failed to read args\n");
             fflush(stdout);
             break; /* stdin broken — exit daemon */
         }
 
         /* Lazy init: start the OpenCL engine on the first valid job.
-           This ensures pocl's JIT threads from clBuildProgram have
-           completed before we execute any kernel.                    */
+           By the time this runs the args are fully on the stack and
+           immune to heap corruption from pocl's JIT threads.         */
         if (!engine_ready) {
             if (engine_init() != 0) {
                 fprintf(stderr, "[daemon] Engine init failed\n");
                 fflush(stderr);
-                for (i = 0; i < n; i++) free(args[i]);
-                free(args);
                 printf("ERR: Engine init failed\n");
                 fflush(stdout);
                 break;
@@ -626,8 +626,6 @@ static void run_daemon(void)
         }
 
         int result = exec_job(n, args);
-        for (i = 0; i < n; i++) free(args[i]);
-        free(args);
 
         if (result == 0)
             printf("OK\n");
