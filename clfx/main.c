@@ -610,7 +610,11 @@ static void run_daemon(void)
             break; /* stdin broken — exit daemon */
         }
 
+        fprintf(stderr, "[daemon] dispatching job: n=%d args[0]=%s\n", n, args[0] ? args[0] : "NULL");
+        fflush(stderr);
         int result = exec_job(n, args);
+        fprintf(stderr, "[daemon] job returned: %d\n", result);
+        fflush(stderr);
         for (i = 0; i < n; i++) free(args[i]);
         free(args);
 
