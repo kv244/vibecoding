@@ -87,7 +87,13 @@ void draw_waveform_ascii(const float *data, int numSamples, int width) {
   printf("\n");
 }
 
-#define MAX_EFFECTS 16
+#define MAX_EFFECTS  16
+/* Daemon protocol: max args per job and max length per arg.
+   Stack-allocated in run_daemon to avoid races with pocl's background
+   LLVM JIT threads (which use malloc internally during clBuildProgram).
+   DO NOT free() any pointer from the args[] array — it points to stack. */
+#define DAEMON_MAX_ARGS    66
+#define DAEMON_MAX_ARG_LEN 4096
 
 typedef struct {
   int type;
@@ -574,14 +580,11 @@ static void run_daemon(void)
     fprintf(stderr, "[daemon] CLFX daemon v" CLFX_VERSION " ready\n");
     fflush(stderr);
 
-    /* Use stack-allocated arg storage to avoid heap races with pocl's
-       background LLVM JIT threads that are active during clBuildProgram.
-       MAX_ARGS=66 (64 args + sentinel), MAX_ARG_LEN=4096 per arg.       */
-    #define MAX_ARGS    66
-    #define MAX_ARG_LEN 4096
-    char arg_store[MAX_ARGS][MAX_ARG_LEN + 1];
-    char *args[MAX_ARGS];
-    char line[MAX_ARG_LEN + 1];
+    /* Stack-allocated arg storage — see DAEMON_MAX_ARGS/DAEMON_MAX_ARG_LEN
+       comment above for why heap allocation must be avoided here.        */
+    char arg_store[DAEMON_MAX_ARGS][DAEMON_MAX_ARG_LEN + 1];
+    char *args[DAEMON_MAX_ARGS];
+    char line[DAEMON_MAX_ARG_LEN + 1];
 
     while (fgets(line, sizeof(line), stdin)) {
         int n = atoi(line);
@@ -599,7 +602,7 @@ static void run_daemon(void)
             size_t len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                 line[--len] = '\0';
-            if (len > MAX_ARG_LEN) { ok = 0; break; }
+            if (len > DAEMON_MAX_ARG_LEN) { ok = 0; break; }
             memcpy(arg_store[i], line, len + 1);
             args[i] = arg_store[i];
         }
