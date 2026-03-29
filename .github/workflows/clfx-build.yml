@@ -68,10 +68,17 @@ jobs:
 
     - name: Test Daemon Mode
       run: |
-        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>daemon_stderr.txt)
-        echo "Daemon response: '$RESPONSE'"
+        # Step 1: check engine_init survives with empty stdin
+        ./clfx --daemon </dev/null 2>daemon_stderr.txt
+        echo "=== engine_init test exit: $?"
         echo "--- daemon stderr ---"
-        cat daemon_stderr.txt || true
+        cat daemon_stderr.txt
+
+        # Step 2: send a real job
+        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>>daemon_stderr.txt) || true
+        echo "Daemon response: '$RESPONSE'"
+        echo "--- daemon stderr (job run) ---"
+        cat daemon_stderr.txt
         [ "$RESPONSE" = "OK" ] || { echo "FAIL: expected OK, got: $RESPONSE"; exit 1; }
         ls -lh daemon_out.wav
 
