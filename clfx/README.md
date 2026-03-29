@@ -1,4 +1,4 @@
-# OpenCL Audio Effects Engine (CLFX) v1.0.2
+# OpenCL Audio Effects Engine (CLFX) v1.0.3
 
 [![CLFX Build Verification](https://github.com/kv244/vibecoding/actions/workflows/clfx-build.yml/badge.svg)](https://github.com/kv244/vibecoding/actions/workflows/clfx-build.yml)
 
@@ -133,13 +133,16 @@ Features:
 ### Web Dashboard (Flask)
 
 ```bash
-pip install flask
+pip install -r requirements.txt
 cd gui
 python server.py
 # open http://localhost:5000
 ```
 
-A dark-mode browser interface with drag-and-drop FX rack, real-time sliders, and waveform analysis.
+A dark-mode browser interface with drag-and-drop FX rack, real-time sliders, and waveform analysis. The server runs a persistent daemon worker to keep the OpenCL context alive across requests.
+
+- **Rate limiting** — `/upload` capped at 20 req/min per IP; `/process` at 30 req/min.
+- **Auto cleanup** — uploaded and output files older than 2 hours are deleted automatically (background thread, runs every 30 minutes).
 
 ## 🤖 CI/CD
 
@@ -212,7 +215,7 @@ CLFX includes a production-ready Dockerfile and a GitHub Actions workflow for ze
    Create a Google Cloud Service Account with **Cloud Run Admin** and **Artifact Registry Writer** permissions. Generate a JSON key and save it as a repository secret named `GCP_CREDENTIALS` in GitHub Settings > Secrets and variables > Actions.
 
 > [!NOTE]
-> The `deploy-cloudrun` job in `.github/workflows/build.yml` is **commented out by default** to prevent the CI pipeline from failing when the repository is forked or when the required authentication secrets are not yet configured. Once your GCP project and secrets are ready, simply uncomment the job to enable automatic zero-downtime deployments.
+> The `deploy-cloudrun` job in [`.github/workflows/clfx-build.yml`](.github/workflows/clfx-build.yml) is **commented out by default** to prevent the CI pipeline from failing when the repository is forked or when the required authentication secrets are not yet configured. Once your GCP project and secrets are ready, simply uncomment the job to enable automatic zero-downtime deployments.
 
 ## 🔬 Implementation Details
 
@@ -229,6 +232,9 @@ CLFX now supports frequency-domain processing through a self-contained **Radix-2
 > [!TIP]
 > Spectral effects force a `local_size` of 256 in `main.c` to guarantee full coverage of the 1024-point FFT window (256 work-items * 4 samples per item), ensuring maximum hardware utilization on modern GPUs.
 
+> [!IMPORTANT]
+> Spectral effects (`eq`, `freeze`, `convolve`) require the input WAV to contain **at least 1024 samples** (~23ms at 44100 Hz). Shorter inputs are rejected with an error message.
+
 ---
-**Version:** 1.0.3 | **Last Updated:** 2026-03-29
+**Version:** 1.0.3 | **Last Updated:** 2026-03-29 | [Changelog](https://github.com/kv244/vibecoding/commits/main/clfx)
 Developed for high-performance audio experimentation.
