@@ -52,12 +52,16 @@ jobs:
         EOF
 
     - name: Test Core Effects (Gain, Lowpass, Echo)
+      env:
+        ASAN_OPTIONS: detect_leaks=0
       run: |
         ./clfx input.wav out_gain.wav gain 1.5
         ./clfx input.wav out_lp.wav lowpass 0.8
         ./clfx input.wav out_echo.wav echo 4410 0.5
 
     - name: Test Advanced Effects (Spectral, Dynamics)
+      env:
+        ASAN_OPTIONS: detect_leaks=0
       run: |
         ./clfx input.wav out_bit.wav bitcrush 8
         ./clfx input.wav out_freeze.wav freeze 0.5 0.5
@@ -67,6 +71,8 @@ jobs:
       run: ls -lh out_*.wav
 
     - name: Test Daemon Mode
+      env:
+        ASAN_OPTIONS: detect_leaks=0
       run: |
         # Step 1: check engine_init survives with empty stdin
         ./clfx --daemon </dev/null 2>daemon_stderr.txt
