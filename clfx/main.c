@@ -406,6 +406,16 @@ static int exec_job(int argc, char **argv)
         fprintf(stderr, "[job] Empty audio data\n");
         fclose(fp); return -1;
     }
+    /* Spectral effects (eq/freeze/convolve) use a 1024-point FFT per work-group.
+       Inputs shorter than 1024 samples leave fft_scratch slots uninitialized,
+       producing garbage output.  Reject early with a clear message. */
+    for (int _s = 0; _s < num_effects; _s++) {
+        if (chain[_s].type >= 14 && chain[_s].type <= 16 && numSamples < 1024) {
+            fprintf(stderr, "[job] Spectral effects require at least 1024 samples "
+                            "(input has %d)\n", numSamples);
+            fclose(fp); return -1;
+        }
+    }
     raw_data = malloc(header.subchunk2Size);
     if (!raw_data || fread(raw_data, header.subchunk2Size, 1, fp) != 1) {
         fprintf(stderr, "[job] Failed to read audio\n");
@@ -1133,6 +1143,14 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Empty audio data\n");
     ret = 1;
     goto cleanup;
+  }
+  for (int _s = 0; _s < num_effects; _s++) {
+    if (chain[_s].type >= 14 && chain[_s].type <= 16 && numSamples < 1024) {
+      fprintf(stderr, "Spectral effects require at least 1024 samples "
+                      "(input has %d)\n", numSamples);
+      ret = 1;
+      goto cleanup;
+    }
   }
   raw_data = malloc(header.subchunk2Size);
   if (!raw_data) {

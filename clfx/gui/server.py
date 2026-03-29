@@ -5,9 +5,18 @@ import uuid
 import time
 import platform as pf
 from flask import Flask, request, send_from_directory, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB Limit
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],          # no global limit; apply per-route only
+    storage_uri="memory://",    # in-process; fine for single-worker Cloud Run
+)
 
 # -- Paths ---------------------------------------------------------------
 GUI_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +43,30 @@ VALID_EFFECTS = {
 
 for d in [OUTPUT_DIR, UPLOADS_DIR]:
     os.makedirs(d, exist_ok=True)
+
+# ── Temp file cleanup ────────────────────────────────────────────────────────
+
+FILE_MAX_AGE_SECONDS = 2 * 60 * 60  # 2 hours
+
+def _cleanup_old_files():
+    """Delete files older than FILE_MAX_AGE_SECONDS from upload and output dirs."""
+    while True:
+        time.sleep(30 * 60)  # run every 30 minutes
+        cutoff = time.time() - FILE_MAX_AGE_SECONDS
+        for directory in [UPLOADS_DIR, OUTPUT_DIR]:
+            try:
+                for fname in os.listdir(directory):
+                    fpath = os.path.join(directory, fname)
+                    try:
+                        if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                            os.remove(fpath)
+                    except OSError:
+                        pass  # already deleted or permission error — skip
+            except OSError:
+                pass
+
+_cleanup_thread = threading.Thread(target=_cleanup_old_files, daemon=True)
+_cleanup_thread.start()
 
 def sanitize_path(path, base_dir):
     """Ensure path is within base_dir and normalized."""
@@ -139,6 +172,7 @@ _worker = ClfxWorker()
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/upload', methods=['POST'])
+@limiter.limit("20 per minute; 100 per hour")
 def upload_file():
     if 'file' not in request.files:
         return jsonify({"success": False, "error": "No file part"}), 400
@@ -240,6 +274,7 @@ def get_system_info():
     return jsonify(info)
 
 @app.route('/process', methods=['POST'])
+@limiter.limit("30 per minute; 200 per hour")
 def process():
     data = request.json
     input_file_raw = data.get('inputFile')
