@@ -82,7 +82,13 @@ if __name__ == "__main__":
 
 ## 🎯 Usage
 
-Run the executable with an input WAV file (uncompressed PCM, 16-bit) and specify the effect:
+Run the executable with an input WAV file and specify the effect:
+
+> [!WARNING]
+> CLFX requires **bare 44-byte PCM WAV files** (16-bit, uncompressed). Files exported by DAWs or audio editors often include extra metadata chunks (`LIST`, `INFO`, `JUNK`, `bext`) before the audio data, which will cause the engine to misparse the header and produce silence or garbage output. If in doubt, strip metadata first:
+> ```bash
+> ffmpeg -i input.wav -acodec pcm_s16le -ar 44100 output_clean.wav
+> ```
 
 ```bash
 ./clfx.exe <input.wav> <output.wav> <effect> [param1] [param2] [--platform <id>] [--device <id>] [--dump-binary]
