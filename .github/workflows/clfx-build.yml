@@ -66,13 +66,29 @@ jobs:
     - name: Verify Linux Outputs Generated
       run: ls -lh out_*.wav
 
+    - name: Generate Short Daemon Test WAV
+      run: |
+        python3 - <<'EOF'
+        import wave, struct, math
+        # Very short WAV (0.05s, 2205 samples) to minimise OpenCL work-group
+        # count on pocl CPU, which allocates 16KB local mem per work-group
+        sample_rate = 44100
+        duration_samples = 2205
+        f = wave.open('tiny.wav', 'w')
+        f.setnchannels(2)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        for i in range(duration_samples):
+            val = int(32767 * math.sin(2 * math.pi * 440 * i / sample_rate))
+            f.writeframesraw(struct.pack('<hh', val, val))
+        f.close()
+        EOF
+
     - name: Test Daemon Mode
       env:
-        # Limit pocl's JIT thread pool to prevent background LLVM threads
-        # from racing with the main thread's heap allocations in daemon mode
         POCL_MAX_PTHREAD_COUNT: "1"
       run: |
-        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>daemon_stderr.txt)
+        RESPONSE=$(printf '4\ntiny.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>daemon_stderr.txt)
         echo "Daemon response: '$RESPONSE'"
         cat daemon_stderr.txt
         [ "$RESPONSE" = "OK" ] || { echo "FAIL: expected OK, got: $RESPONSE"; exit 1; }
