@@ -28,7 +28,7 @@ jobs:
       run: sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd
 
     - name: Compile Engine
-      run: gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L
+      run: gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L -fsanitize=address -fno-omit-frame-pointer -g
 
     - name: Query Binary Info
       run: |
