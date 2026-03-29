@@ -68,8 +68,10 @@ jobs:
 
     - name: Test Daemon Mode
       run: |
-        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>/dev/null)
+        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>daemon_stderr.txt)
         echo "Daemon response: '$RESPONSE'"
+        echo "--- daemon stderr ---"
+        cat daemon_stderr.txt || true
         [ "$RESPONSE" = "OK" ] || { echo "FAIL: expected OK, got: $RESPONSE"; exit 1; }
         ls -lh daemon_out.wav
 
@@ -115,7 +117,6 @@ jobs:
     - name: Generate Test WAV
       shell: pwsh
       run: |
-        cd clfx
         python -c "
         import wave, struct, math
         sample_rate = 44100
