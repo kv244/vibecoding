@@ -382,6 +382,23 @@ __kernel void apply_effects(__global const float4* input,
 
         barrier(CLK_LOCAL_MEM_FENCE);
 
+        // 4. Bit-reversal permutation before IFFT (mirrors forward FFT step)
+        for (int i = 0; i < 4; i++) {
+            int idx = lid * 4 + i;
+            if (idx < n) {
+                int m2 = idx, rev2 = 0;
+                #pragma unroll
+                for (int k = 0; k < 10; k++) {
+                    rev2 = (rev2 << 1) | (m2 & 1);
+                    m2 >>= 1;
+                }
+                fft_scratch[rev2] = fft_data[idx];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int i = lid; i < n; i += wg) fft_data[i] = fft_scratch[i];
+        barrier(CLK_LOCAL_MEM_FENCE);
+
         // 5. IFFT Stages
         for (int len = 2; len <= n; len <<= 1) {
             float ang = 6.2831853f / len;

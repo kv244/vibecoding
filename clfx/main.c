@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CLFX_VERSION "1.0.1"
+#define CLFX_VERSION "1.0.3"
 
 static inline void *port_aligned_alloc(size_t size, size_t alignment) {
 #ifdef _WIN32
@@ -26,6 +26,17 @@ static inline void port_aligned_free(void *ptr) {
 #else
   free(ptr);
 #endif
+}
+
+/* Returns a pointer into `path` at the start of the filename component.
+   No allocation — the returned pointer aliases the input string. */
+static const char *path_basename(const char *path) {
+  const char *s = strrchr(path, '/');
+#ifdef _WIN32
+  const char *s2 = strrchr(path, '\\');
+  if (s2 && (!s || s2 > s)) s = s2;
+#endif
+  return s ? s + 1 : path;
 }
 
 static inline float clamp(float val, float min, float max) {
@@ -87,7 +98,8 @@ void draw_waveform_ascii(const float *data, int numSamples, int width) {
   printf("\n");
 }
 
-#define MAX_EFFECTS  16
+#define MAX_EFFECTS    16
+#define MAX_WAV_BYTES  (500u * 1024u * 1024u)  /* 500 MB hard cap on input size */
 /* Daemon protocol: max args per job and max length per arg.
    Stack-allocated in run_daemon to avoid races with pocl's background
    LLVM JIT threads (which use malloc internally during clBuildProgram).
@@ -377,7 +389,23 @@ static int exec_job(int argc, char **argv)
         fprintf(stderr, "[job] Invalid WAV (need 16-bit PCM)\n");
         fclose(fp); return -1;
     }
+    if (header.numChannels == 0 || header.numChannels > 8) {
+        fprintf(stderr, "[job] Invalid channel count: %u\n", header.numChannels);
+        fclose(fp); return -1;
+    }
+    if (header.sampleRate == 0) {
+        fprintf(stderr, "[job] Invalid sample rate\n");
+        fclose(fp); return -1;
+    }
+    if (header.subchunk2Size == 0 || header.subchunk2Size > MAX_WAV_BYTES) {
+        fprintf(stderr, "[job] WAV data size out of range: %u bytes\n", header.subchunk2Size);
+        fclose(fp); return -1;
+    }
     numSamples = (int)(header.subchunk2Size / sizeof(int16_t));
+    if (numSamples == 0) {
+        fprintf(stderr, "[job] Empty audio data\n");
+        fclose(fp); return -1;
+    }
     raw_data = malloc(header.subchunk2Size);
     if (!raw_data || fread(raw_data, header.subchunk2Size, 1, fp) != 1) {
         fprintf(stderr, "[job] Failed to read audio\n");
@@ -418,7 +446,7 @@ static int exec_job(int argc, char **argv)
     }
     if (ir_filename) {
         char cache_name[256];
-        snprintf(cache_name, sizeof(cache_name), "%s.clir", ir_filename);
+        snprintf(cache_name, sizeof(cache_name), "%s.clir", path_basename(ir_filename));
         int cache_loaded = 0;
         FILE *fcache = fopen(cache_name, "rb");
         if (fcache) {
@@ -1078,6 +1106,21 @@ int main(int argc, char *argv[]) {
     ret = 1;
     goto cleanup;
   }
+  if (header.numChannels == 0 || header.numChannels > 8) {
+    fprintf(stderr, "Invalid channel count: %u\n", header.numChannels);
+    ret = 1;
+    goto cleanup;
+  }
+  if (header.sampleRate == 0) {
+    fprintf(stderr, "Invalid sample rate\n");
+    ret = 1;
+    goto cleanup;
+  }
+  if (header.subchunk2Size == 0 || header.subchunk2Size > MAX_WAV_BYTES) {
+    fprintf(stderr, "WAV data size out of range: %u bytes\n", header.subchunk2Size);
+    ret = 1;
+    goto cleanup;
+  }
 
   printf("Input WAV: %s\n", argv[1]);
   printf("  Channels:    %d (%s)\n", header.numChannels,
@@ -1086,6 +1129,11 @@ int main(int argc, char *argv[]) {
   printf("  Data Size:   %u bytes\n", header.subchunk2Size);
 
   int numSamples = header.subchunk2Size / sizeof(int16_t);
+  if (numSamples == 0) {
+    fprintf(stderr, "Empty audio data\n");
+    ret = 1;
+    goto cleanup;
+  }
   raw_data = malloc(header.subchunk2Size);
   if (!raw_data) {
     perror("Failed to allocate raw_data");
@@ -1310,7 +1358,7 @@ int main(int argc, char *argv[]) {
 
   if (ir_filename) {
     char cache_name[256];
-    snprintf(cache_name, 256, "%s.clir", ir_filename);
+    snprintf(cache_name, sizeof(cache_name), "%s.clir", path_basename(ir_filename));
 
     int cache_loaded = 0;
     FILE *fcache = fopen(cache_name, "rb");
@@ -1472,7 +1520,7 @@ int main(int argc, char *argv[]) {
   // Final result is in d_in (due to the swap after the last kernel call)
   // --- 4. Read Result ---
   h_output = (float *)clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_READ, 0,
-                                         sizeof(float) * numSamples, 0, NULL,
+                                         sizeof(float) * paddedSamples, 0, NULL,
                                          NULL, &err);
   checkErr(err, "clEnqueueMapBuffer (final)");
 
