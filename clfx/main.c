@@ -511,27 +511,17 @@ static int exec_job(int argc, char **argv)
         if (chain[i].type >= 14)
             cur_global = ((cur_global + 255) / 256) * 256;
 
-        fprintf(stderr, "[job] enqueueing kernel: type=%d global=%zu local=%zu\n",
-                chain[i].type, cur_global, local_size); fflush(stderr);
         err = clEnqueueNDRangeKernel(g_engine.queue, g_engine.kernel, 1, NULL,
                                      &cur_global, &local_size, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             fprintf(stderr, "[job] clEnqueueNDRangeKernel failed: %d\n", err);
             ret = -1; goto job_cleanup;
         }
-        fprintf(stderr, "[job] waiting for kernel...\n"); fflush(stderr);
-        err = clFinish(g_engine.queue);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "[job] clFinish failed: %d\n", err);
-            ret = -1; goto job_cleanup;
-        }
-        fprintf(stderr, "[job] kernel complete\n"); fflush(stderr);
 
         cl_mem tmp = d_in; d_in = d_out; d_out = tmp; /* ping-pong */
     }
 
     /* ── Read back result and write output WAV ──────────────────────────── */
-    fprintf(stderr, "[job] reading back result...\n"); fflush(stderr);
     /* Map the full padded buffer (kernel may have written beyond numSamples) */
     h_mapped = (float *)clEnqueueMapBuffer(g_engine.queue, d_in, CL_TRUE, CL_MAP_READ,
                                            0, sizeof(float) * paddedSamples,
@@ -574,6 +564,13 @@ job_cleanup:
 static void run_daemon(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0); /* unbuffered stdout for protocol */
+
+    /* Defer engine_init until after the first job's args are fully read.
+       On Linux/pocl, clBuildProgram may spawn background LLVM JIT threads
+       that outlive the call and race with glibc malloc.  By reading stdin
+       first we give those threads time to settle before we alloc/exec.    */
+    int engine_ready = 0;
+
     fprintf(stderr, "[daemon] CLFX daemon v" CLFX_VERSION " ready\n");
     fflush(stderr);
 
@@ -612,6 +609,22 @@ static void run_daemon(void)
             break; /* stdin broken — exit daemon */
         }
 
+        /* Lazy init: start the OpenCL engine on the first valid job.
+           This ensures pocl's JIT threads from clBuildProgram have
+           completed before we execute any kernel.                    */
+        if (!engine_ready) {
+            if (engine_init() != 0) {
+                fprintf(stderr, "[daemon] Engine init failed\n");
+                fflush(stderr);
+                for (i = 0; i < n; i++) free(args[i]);
+                free(args);
+                printf("ERR: Engine init failed\n");
+                fflush(stdout);
+                break;
+            }
+            engine_ready = 1;
+        }
+
         int result = exec_job(n, args);
         for (i = 0; i < n; i++) free(args[i]);
         free(args);
@@ -622,6 +635,9 @@ static void run_daemon(void)
             printf("ERR: Processing failed\n");
         fflush(stdout);
     }
+
+    if (engine_ready)
+        engine_destroy();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -631,12 +647,7 @@ int main(int argc, char *argv[]) {
      or any other processing.                                             */
   for (int _i = 1; _i < argc; _i++) {
     if (strcmp(argv[_i], "--daemon") == 0) {
-      if (engine_init() != 0) {
-        fprintf(stderr, "[daemon] Engine init failed\n");
-        return 1;
-      }
-      run_daemon();
-      engine_destroy();
+      run_daemon(); /* engine_init/destroy handled lazily inside */
       return 0;
     }
   }
