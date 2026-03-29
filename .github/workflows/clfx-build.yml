@@ -88,9 +88,10 @@ jobs:
       env:
         POCL_MAX_PTHREAD_COUNT: "1"
       run: |
-        RESPONSE=$(printf '4\ntiny.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>daemon_stderr.txt)
+        RESPONSE=$(printf '4\ntiny.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>daemon_stderr.txt) || true
         echo "Daemon response: '$RESPONSE'"
-        cat daemon_stderr.txt
+        echo "--- daemon stderr ---"
+        cat daemon_stderr.txt || true
         [ "$RESPONSE" = "OK" ] || { echo "FAIL: expected OK, got: $RESPONSE"; exit 1; }
         ls -lh daemon_out.wav
 
