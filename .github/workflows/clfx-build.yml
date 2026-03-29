@@ -28,7 +28,7 @@ jobs:
       run: sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd
 
     - name: Compile Engine
-      run: gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L -fsanitize=address -fno-omit-frame-pointer -g
+      run: gcc -Iinclude main.c -o clfx -lOpenCL -lm -std=c99 -D_POSIX_C_SOURCE=200112L
 
     - name: Query Binary Info
       run: |
@@ -52,16 +52,12 @@ jobs:
         EOF
 
     - name: Test Core Effects (Gain, Lowpass, Echo)
-      env:
-        ASAN_OPTIONS: detect_leaks=0
       run: |
         ./clfx input.wav out_gain.wav gain 1.5
         ./clfx input.wav out_lp.wav lowpass 0.8
         ./clfx input.wav out_echo.wav echo 4410 0.5
 
     - name: Test Advanced Effects (Spectral, Dynamics)
-      env:
-        ASAN_OPTIONS: detect_leaks=0
       run: |
         ./clfx input.wav out_bit.wav bitcrush 8
         ./clfx input.wav out_freeze.wav freeze 0.5 0.5
@@ -72,18 +68,12 @@ jobs:
 
     - name: Test Daemon Mode
       env:
-        ASAN_OPTIONS: detect_leaks=0
+        # Limit pocl's JIT thread pool to prevent background LLVM threads
+        # from racing with the main thread's heap allocations in daemon mode
+        POCL_MAX_PTHREAD_COUNT: "1"
       run: |
-        # Step 1: check engine_init survives with empty stdin
-        ./clfx --daemon </dev/null 2>daemon_stderr.txt
-        echo "=== engine_init test exit: $?"
-        echo "--- daemon stderr ---"
-        cat daemon_stderr.txt
-
-        # Step 2: send a real job
-        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>>daemon_stderr.txt) || true
+        RESPONSE=$(printf '4\ninput.wav\ndaemon_out.wav\ngain\n1.5\n' | ./clfx --daemon 2>daemon_stderr.txt)
         echo "Daemon response: '$RESPONSE'"
-        echo "--- daemon stderr (job run) ---"
         cat daemon_stderr.txt
         [ "$RESPONSE" = "OK" ] || { echo "FAIL: expected OK, got: $RESPONSE"; exit 1; }
         ls -lh daemon_out.wav

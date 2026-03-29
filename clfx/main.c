@@ -280,6 +280,12 @@ static int engine_init(void)
                                    sizeof(size_t), &g_engine.preferred_wg_size, NULL);
     if (err != CL_SUCCESS) g_engine.preferred_wg_size = 64;
 
+    /* Flush any pending pocl background JIT threads before returning.
+       Enqueue a no-op marker and wait for it so LLVM finishes compiling
+       and releases its internal allocations before the stdio loop starts. */
+    clEnqueueMarkerWithWaitList(g_engine.queue, 0, NULL, NULL);
+    clFinish(g_engine.queue);
+
     fprintf(stderr, "[daemon] Engine ready (preferred_wg=%zu)\n", g_engine.preferred_wg_size);
     return 0;
 }
@@ -362,7 +368,6 @@ static int exec_job(int argc, char **argv)
         arg_idx++;
     }
     if (num_effects == 0) { fprintf(stderr, "[job] No effects specified\n"); return -1; }
-    fprintf(stderr, "[job] effects parsed: %d\n", num_effects);
 
     /* ── Load input WAV ─────────────────────────────────────────────────── */
     fp = fopen(argv[0], "rb");
@@ -379,8 +384,6 @@ static int exec_job(int argc, char **argv)
         fclose(fp); free(raw_data); return -1;
     }
     fclose(fp); fp = NULL;
-    fprintf(stderr, "[job] WAV loaded: %d samples, %d ch, %dHz\n",
-            numSamples, (int)header.numChannels, (int)header.sampleRate);
 
     /* ── Allocate per-request GPU buffers ───────────────────────────────── */
     /* Align to 256*4=1024 samples (covers spectral TILE_SIZE=256 × float4) */
@@ -396,7 +399,6 @@ static int exec_job(int argc, char **argv)
         ret = -1; goto job_cleanup;
     }
     d_initial_in = d_in; d_initial_out = d_out;
-    fprintf(stderr, "[job] CL buffers created (%d padded samples)\n", paddedSamples);
 
     h_mapped = (float *)clEnqueueMapBuffer(g_engine.queue, d_in, CL_TRUE, CL_MAP_WRITE,
                                            0, sizeof(float) * paddedSamples,
@@ -409,7 +411,6 @@ static int exec_job(int argc, char **argv)
     for (int i = 0; i < numSamples; i++) h_mapped[i] = raw_data[i] / 32768.0f;
     clEnqueueUnmapMemObject(g_engine.queue, d_in, h_mapped, 0, NULL, NULL);
     h_mapped = NULL;
-    fprintf(stderr, "[job] input uploaded to GPU\n");
 
     /* ── IR / convolution handling ──────────────────────────────────────── */
     for (int i = 0; i < num_effects; i++) {
@@ -516,15 +517,12 @@ static int exec_job(int argc, char **argv)
         if (chain[i].type >= 14)
             cur_global = ((cur_global + 255) / 256) * 256;
 
-        fprintf(stderr, "[job] enqueue kernel: type=%d gsize=%zu lsize=%zu\n",
-                chain[i].type, cur_global, local_size);
         err = clEnqueueNDRangeKernel(g_engine.queue, g_engine.kernel, 1, NULL,
                                      &cur_global, &local_size, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             fprintf(stderr, "[job] clEnqueueNDRangeKernel failed: %d\n", err);
             ret = -1; goto job_cleanup;
         }
-        fprintf(stderr, "[job] kernel enqueued OK\n");
 
         cl_mem tmp = d_in; d_in = d_out; d_out = tmp; /* ping-pong */
     }
@@ -585,22 +583,18 @@ static void run_daemon(void)
             continue;
         }
 
-        fprintf(stderr, "[daemon] n=%d, allocating arg array\n", n); fflush(stderr);
         char **args = (char **)malloc((size_t)(n + 1) * sizeof(char *));
         if (!args) { printf("ERR: OOM\n"); fflush(stdout); continue; }
-        fprintf(stderr, "[daemon] arg array allocated\n"); fflush(stderr);
 
         int ok = 1;
         int i;
         for (i = 0; i < n; i++) {
             args[i] = NULL;
-            fprintf(stderr, "[daemon] reading arg[%d]\n", i); fflush(stderr);
             if (!fgets(line, sizeof(line), stdin)) { ok = 0; break; }
             size_t len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                 line[--len] = '\0';
             if (len > 4096) { ok = 0; break; } /* guard against truncated fgets lines */
-            fprintf(stderr, "[daemon] arg[%d]='%s' len=%zu\n", i, line, len); fflush(stderr);
             args[i] = strdup(line);
             if (!args[i]) { ok = 0; break; }
         }
@@ -614,11 +608,7 @@ static void run_daemon(void)
             break; /* stdin broken — exit daemon */
         }
 
-        fprintf(stderr, "[daemon] dispatching job: n=%d args[0]=%s\n", n, args[0] ? args[0] : "NULL");
-        fflush(stderr);
         int result = exec_job(n, args);
-        fprintf(stderr, "[daemon] job returned: %d\n", result);
-        fflush(stderr);
         for (i = 0; i < n; i++) free(args[i]);
         free(args);
 
