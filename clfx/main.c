@@ -280,12 +280,6 @@ static int engine_init(void)
                                    sizeof(size_t), &g_engine.preferred_wg_size, NULL);
     if (err != CL_SUCCESS) g_engine.preferred_wg_size = 64;
 
-    /* Flush any pending pocl background JIT threads before returning.
-       Enqueue a no-op marker and wait for it so LLVM finishes compiling
-       and releases its internal allocations before the stdio loop starts. */
-    clEnqueueMarkerWithWaitList(g_engine.queue, 0, NULL, NULL);
-    clFinish(g_engine.queue);
-
     fprintf(stderr, "[daemon] Engine ready (preferred_wg=%zu)\n", g_engine.preferred_wg_size);
     return 0;
 }
