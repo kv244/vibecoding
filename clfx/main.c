@@ -235,24 +235,28 @@ static int engine_init(void)
 
     char dev_name[128] = {0};
     clGetDeviceInfo(g_engine.device, CL_DEVICE_NAME, sizeof(dev_name), dev_name, NULL);
-    fprintf(stderr, "[daemon] Device: %s\n", dev_name);
+    fprintf(stderr, "[daemon] Device: %s\n", dev_name); fflush(stderr);
 
     g_engine.context = clCreateContext(NULL, 1, &g_engine.device, NULL, NULL, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "[daemon] clCreateContext failed: %d\n", err); return -1; }
+    fprintf(stderr, "[daemon] context OK\n"); fflush(stderr);
 
     g_engine.queue = clCreateCommandQueueWithProperties(g_engine.context, g_engine.device, NULL, &err);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[daemon] clCreateCommandQueue failed: %d\n", err);
         clReleaseContext(g_engine.context); return -1;
     }
+    fprintf(stderr, "[daemon] queue OK\n"); fflush(stderr);
 
     char *src = load_kernel_source("kernel.cl");
     if (!src) { fprintf(stderr, "[daemon] Failed to load kernel.cl\n"); return -1; }
+    fprintf(stderr, "[daemon] kernel.cl loaded\n"); fflush(stderr);
 
     g_engine.program = clCreateProgramWithSource(g_engine.context, 1,
                                                  (const char **)&src, NULL, &err);
     free(src);
     if (err != CL_SUCCESS) { fprintf(stderr, "[daemon] clCreateProgramWithSource failed\n"); return -1; }
+    fprintf(stderr, "[daemon] program source OK, building...\n"); fflush(stderr);
 
     /* Always compile with TILE_SIZE=256 — safe for all effects (spectral needs
        256; non-spectral ignore the shared memory entirely).                   */
