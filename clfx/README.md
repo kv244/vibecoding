@@ -1,22 +1,18 @@
 # OpenCL Audio Effects Engine (CLFX) v1.0.2
 
-[![Build & Test](https://github.com/kv244/vibecoding/actions/workflows/build.yml/badge.svg)](https://github.com/kv244/vibecoding/actions/workflows/build.yml)
+[![CLFX Build Verification](https://github.com/kv244/vibecoding/actions/workflows/clfx-build.yml/badge.svg)](https://github.com/kv244/vibecoding/actions/workflows/clfx-build.yml)
 
 A high-performance, hardened, and multiplatform-safe OpenCL audio processing engine for WAV files. Optimized for modern GPUs (including Intel Iris Xe) with vectorization, local memory caching, and zero-copy unified memory support.
 
 ## 🚀 Key Features
 
-- **High-Performance Audio Effects**:
-  - **Gain**: Adjustable signal multiplier with automatic clipping.
-  - **Echo/Delay**: Parallelized one-shot reflection.
-  - **Low-pass Filter**: Smoothed 3-tap FIR filter utilizing `__local` memory caching.
-  - **Bitcrush**: Pre-computed bit-depth reduction for a classic "lo-fi" sound.
-- **Hardware-Accelerated**: Full OpenCL 3.0 backend with `float4` vectorization.
-- **Multiplatform Safe**: Dynamically queries hardware limits at runtime to ensure compatibility across different GPUs and CPUs (supports Windows, Linux, and Raspberry Pi 5).
-- **Hardened Security**:
-  - **Path Jailing**: Prevents directory traversal attacks via `os.path.realpath` containment.
-  - **Type Safety**: Strictly validates all numeric parameters as floats in both frontend and backend.
-  - **Execution Timeouts**: Proactive subprocess monitoring (120s limit) to prevent server hangs.
+- **21 Audio Effects** — gain, pan, eq, lowpass, distortion, bitcrush, compress, gate, autowah, chorus, flange, phase, tremolo, widening, ringmod, pitch, echo, pingpong, reverb, convolve, freeze.
+- **Hardware-Accelerated** — OpenCL 3.0 backend with `float4` vectorization and `__local` memory caching.
+- **Daemon Mode** — persistent `--daemon` process keeps the OpenCL context alive across jobs, eliminating per-file compile overhead.
+- **Tkinter GUI** — native desktop interface with effect chain editor, waveform preview, native WAV playback, and parameter editing per effect.
+- **Multiplatform** — Windows (MinGW-w64), Linux (pocl CPU or GPU driver), Raspberry Pi 5.
+- **Effect Chaining** — chain multiple effects in a single pass with `--mix` dry/wet control.
+- **Spectral Processing** — frequency-domain effects (EQ, Freeze, Convolution) via an in-kernel Radix-2 FFT/IFFT.
 
 ## 🛠️ Performance Optimizations
 
@@ -115,25 +111,41 @@ For detailed analysis, use the provided `visualize.py` script. It generates a hi
 python visualize.py output.wav
 ```
 
-## 🖥️ Graphical Dashboard (GUI)
+## 🖥️ GUI
 
-CLFX includes a professional-grade web dashboard for building effect chains visually. It features a modern dark-mode interface with glassmorphism, real-time parameter sliders, and automated waveform analysis.
+CLFX ships two interfaces:
 
-### To Launch:
-1. Ensure you have **Flask** installed:
-   ```bash
-   pip install flask
-   ```
-2. Navigate to the GUI directory and start the server:
-   ```bash
-   cd gui
-   python server.py
-   ```
-3. Open your browser to `http://localhost:5000`.
+### Desktop GUI (Tkinter — recommended)
+
+No server required. Place `clfx_gui.py` next to `clfx.exe` / `clfx` and run:
+
+```bash
+python clfx_gui.py
+```
+
+Features:
+- **Effect chain editor** — add, remove, reorder effects; click any applied effect to edit its parameters inline.
+- **Apply Params button** — writes spinbox values back to the chain before processing.
+- **Waveform preview** — live canvas redraws after processing or when effects are removed.
+- **Native playback** — Play / Stop buttons using `winsound` (Windows) or `afplay` / `aplay` (macOS / Linux). No external media player.
+- **Help → About / Engine Info** — shows OpenCL platform, GPU/CPU device, GUI version, and full effect list.
+
+### Web Dashboard (Flask)
+
+```bash
+pip install flask
+cd gui
+python server.py
+# open http://localhost:5000
+```
+
+A dark-mode browser interface with drag-and-drop FX rack, real-time sliders, and waveform analysis.
 
 ## 🤖 CI/CD
 
-Every push to `master` automatically triggers a full build and functional test suite via **GitHub Actions** on Ubuntu:
+Every push to `master` automatically triggers a full build and functional test suite via **GitHub Actions** ([`clfx-build.yml`](.github/workflows/clfx-build.yml)):
+
+#### Linux (OpenCL / pocl)
 1. **Install**: Installs OpenCL runtime (`pocl-opencl-icd`)
 2. **Compile**: Builds `clfx` from source using GCC
 3. **Probe**: Runs `clfx --info` to verify the binary can detect platform/device info
@@ -141,6 +153,13 @@ Every push to `master` automatically triggers a full build and functional test s
 5. **Test Core Effects**: Gain, Lowpass, Echo
 6. **Test Advanced Effects**: Bitcrush, Spectral Freeze, Noise Gate
 7. **Validate**: Confirms all output WAV files were written successfully
+8. **Test Daemon Mode**: Sends a job over stdin and verifies the `OK` response
+
+#### Windows (MSYS2 / MinGW-w64)
+1. **Set up MSYS2**: Installs MinGW-w64 GCC and OpenCL headers/ICD
+2. **Compile**: Builds `clfx.exe` as a native Windows PE binary
+3. **Verify**: Runs `clfx.exe --info` to confirm the binary loads
+4. **Generate & Run Effects**: Creates a test WAV and processes with Gain and Echo
 
 ### Features:
 - **Drag-and-Drop FX Rack**: Reorder your signal chain visually to control the processing path instantly.
@@ -160,14 +179,14 @@ Every push to `master` automatically triggers a full build and functional test s
 | `widening`| Width (>1.0) | - | `widening 1.5` |
 | `pingpong`| Delay (samples) | Decay (0.0 - 1.0) | `pingpong 8820 0.5` |
 | `chorus`  | - | - | `chorus` |
-| `autowah` | - | - | `autowah` |
+| `autowah` | Depth (0.0 - 1.0) | Rate (0.0 - 1.0) | `autowah 0.5 0.2` |
 | `distortion`| Drive (>1.0) | - | `distortion 5.0` |
 | `ringmod` | Carrier Freq (Hz)| - | `ringmod 440` |
 | `pitch`   | Ratio (0.5 - 2.0)| - | `pitch 1.5` |
 | `gate`    | Threshold (0.0 - 1.0)| Reduction (0.0 - 1.0) | `gate 0.1 0.0` |
 | `pan`     | L/R Balance (-1 to 1)| - | `pan -0.5` |
 | `eq`      | Center (0.0 - 1.0) | Gain | `eq 0.5 2.0` |
-| `freeze`  | - | - | `freeze` |
+| `freeze`  | Amount (0.0 - 1.0) | Randomness (0.0 - 1.0) | `freeze 0.5 0.0` |
 | `convolve`| IR WAV Path | - | `convolve ir.wav` |
 | `phase`   | Depth (0.0 - 1.0) | Rate (0.0 - 1.0) | `phase 0.5 0.2` |
 | `compress`| Threshold (0.0 - 1.0)| Ratio (1 - 20) | `compress 0.5 4` |
@@ -211,5 +230,5 @@ CLFX now supports frequency-domain processing through a self-contained **Radix-2
 > Spectral effects force a `local_size` of 256 in `main.c` to guarantee full coverage of the 1024-point FFT window (256 work-items * 4 samples per item), ensuring maximum hardware utilization on modern GPUs.
 
 ---
-**Version:** 1.0.2 | **Last Commit:** 2026-02-22
+**Version:** 1.0.3 | **Last Updated:** 2026-03-29
 Developed for high-performance audio experimentation.
