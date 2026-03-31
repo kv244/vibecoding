@@ -164,9 +164,8 @@ class CLFXGUI:
             "freeze": "Freeze effect: amount (0.0-1.0) and randomness (0.0-1.0)."
         }
 
-        for effect, tooltip in self.tooltips.items():
-            effect_dropdown.bind('<Enter>', lambda e, t=tooltip: self.show_tooltip(e, t))
-            effect_dropdown.bind('<Leave>', lambda e: self.hide_tooltip())
+        effect_dropdown.bind('<Enter>', lambda e: self.show_tooltip(e, self.tooltips.get(self.effect_var.get(), "")))
+        effect_dropdown.bind('<Leave>', lambda e: self.hide_tooltip())
 
         # Menu bar
         self.setup_menu()
@@ -514,14 +513,21 @@ class CLFXGUI:
 
                 args = [input_path, output_path]
                 for effect in effects:
-                    args.extend(effect.split())
+                    parts = effect.split(None, 1)
+                    args.append(parts[0])
+                    if len(parts) > 1:
+                        if parts[0] == "convolve":
+                            args.append(parts[1])  # preserve spaces in IR path
+                        else:
+                            args.extend(parts[1].split())
 
                 lines = [str(len(args))] + args
                 payload = "\n".join(lines) + "\n"
                 self.daemon.stdin.write(payload)
                 self.daemon.stdin.flush()
+                daemon_stdout = self.daemon.stdout
 
-                response = self.daemon.stdout.readline().strip()
+            response = daemon_stdout.readline().strip()
 
             if response == "OK":
                 self._last_processed_path = output_path  # track what was actually written
