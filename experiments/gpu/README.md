@@ -93,16 +93,6 @@ vibecoder encrypt --chunk 64 large_file.iso
 
 ---
 
-## `cube.py` — 3D Cube Renderer
+## TRON 3d
 
-Renders a rotating 3D cube using Raylib, automatically selecting the best available compute backend.
-
-**Backend selection:** CUDA (PyTorch) → Numba JIT → NumPy
-
-**Dependencies:** `pyray`, `torch` (optional), `numba` (optional), `numpy`
-
-```bash
-python cube.py
-```
-
-Keyboard controls: arrow keys adjust rotation speed.
+Implemented in CUDA and Python.
