@@ -93,6 +93,6 @@ vibecoder encrypt --chunk 64 large_file.iso
 
 ---
 
-## TRON 3d
+## TRON 3d (main.cu, mainpy)
 
 Implemented in CUDA and Python.
