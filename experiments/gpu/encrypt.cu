@@ -1,6 +1,6 @@
 /**
  * @file encrypt.cu
- * @brief Industrial-Strength GPU File Encryption (ChaCha20-Poly1305 + Argon2id)
+ * @brief Experimental GPU File Encryption (ChaCha20-Poly1305 + Argon2id)
  *
  * Security model:
  *   - Key Derivation : Argon2id (RFC 9106) — memory-hard, GPU/ASIC resistant
@@ -73,6 +73,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include "poly1305.hpp"
 
 #ifndef _WIN32
 #  include <termios.h>
@@ -264,96 +265,8 @@ static void derive_key(const std::string &passphrase, const uint8_t *salt,
 
 // ─── Poly1305 (CPU, RFC 8439) ─────────────────────────────────────────────────
 
-class Poly1305 {
-  uint32_t r[5], h[5], pad[4];
-
-  static uint32_t le32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) |
-           ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
-  }
-
-public:
-  Poly1305(const uint8_t key[32]) {
-    r[0] =  le32(key+ 0) & 0x0fffffff;
-    r[1] = (le32(key+ 3) >>  2) & 0x0ffffffc;
-    r[2] = (le32(key+ 6) >>  4) & 0x0ffffffc;
-    r[3] = (le32(key+ 9) >>  6) & 0x0ffffffc;
-    r[4] = (le32(key+12) >>  8) & 0x0000000f;
-    pad[0]=le32(key+16); pad[1]=le32(key+20);
-    pad[2]=le32(key+24); pad[3]=le32(key+28);
-    h[0]=h[1]=h[2]=h[3]=h[4]=0;
-  }
-
-  void update(const uint8_t *msg, size_t len) {
-    while (len > 0) {
-      uint8_t block[17]={0};
-      size_t want = (len>=16)?16:len;
-      memcpy(block, msg, want);
-      block[want]=1;
-      uint32_t m[5];
-      m[0]=le32(block+ 0); m[1]=le32(block+4);
-      m[2]=le32(block+ 8); m[3]=le32(block+12); m[4]=block[16];
-      h[0]+=m[0]; h[1]+=m[1]; h[2]+=m[2]; h[3]+=m[3]; h[4]+=m[4];
-
-      uint64_t d0=(uint64_t)h[0]*r[0]+(uint64_t)h[1]*(5*r[4])+(uint64_t)h[2]*(5*r[3])+(uint64_t)h[3]*(5*r[2])+(uint64_t)h[4]*(5*r[1]);
-      uint64_t d1=(uint64_t)h[0]*r[1]+(uint64_t)h[1]*    r[0]+(uint64_t)h[2]*(5*r[4])+(uint64_t)h[3]*(5*r[3])+(uint64_t)h[4]*(5*r[2]);
-      uint64_t d2=(uint64_t)h[0]*r[2]+(uint64_t)h[1]*    r[1]+(uint64_t)h[2]*    r[0]+(uint64_t)h[3]*(5*r[4])+(uint64_t)h[4]*(5*r[3]);
-      uint64_t d3=(uint64_t)h[0]*r[3]+(uint64_t)h[1]*    r[2]+(uint64_t)h[2]*    r[1]+(uint64_t)h[3]*    r[0]+(uint64_t)h[4]*(5*r[4]);
-      uint64_t d4=(uint64_t)h[0]*r[4]+(uint64_t)h[1]*    r[3]+(uint64_t)h[2]*    r[2]+(uint64_t)h[3]*    r[1]+(uint64_t)h[4]*    r[0];
-
-      uint32_t c=(uint32_t)(d0>>26); h[0]=(uint32_t)d0&0x3ffffff; d1+=c;
-                 c=(uint32_t)(d1>>26); h[1]=(uint32_t)d1&0x3ffffff; d2+=c;
-                 c=(uint32_t)(d2>>26); h[2]=(uint32_t)d2&0x3ffffff; d3+=c;
-                 c=(uint32_t)(d3>>26); h[3]=(uint32_t)d3&0x3ffffff; d4+=c;
-                 c=(uint32_t)(d4>>26); h[4]=(uint32_t)d4&0x3ffffff; h[0]+=c*5;
-      c=h[0]>>26; h[0]&=0x3ffffff; h[1]+=c;
-      msg+=want; len-=want;
-    }
-  }
-
-  /**
-   * Feed AAD with RFC 8439 §2.8 zero-padding to the next 16-byte boundary.
-   * Called once for the header before any ciphertext is processed.
-   */
-  void update_aad(const uint8_t *aad, size_t len) {
-    update(aad, len);
-    size_t pad_len = (16 - (len % 16)) % 16;
-    if (pad_len) {
-      uint8_t zeros[16]={};
-      update(zeros, pad_len);
-    }
-  }
-
-  void finalize(uint8_t tag[16]) {
-    uint32_t c=h[1]>>26; h[1]&=0x3ffffff; h[2]+=c;
-    c=h[2]>>26; h[2]&=0x3ffffff; h[3]+=c;
-    c=h[3]>>26; h[3]&=0x3ffffff; h[4]+=c;
-    c=h[4]>>26; h[4]&=0x3ffffff; h[0]+=c*5;
-    c=h[0]>>26; h[0]&=0x3ffffff; h[1]+=c;
-    uint32_t g[5];
-    g[0]=h[0]+5; c=g[0]>>26; g[0]&=0x3ffffff;
-    g[1]=h[1]+c; c=g[1]>>26; g[1]&=0x3ffffff;
-    g[2]=h[2]+c; c=g[2]>>26; g[2]&=0x3ffffff;
-    g[3]=h[3]+c; c=g[3]>>26; g[3]&=0x3ffffff;
-    g[4]=h[4]+c-(1<<26);
-    uint32_t mask=(g[4]>>31)-1;
-    for(int i=0;i<5;i++) h[i]=(h[i]&~mask)|(g[i]&mask);
-    uint64_t f;
-    f=(uint64_t)h[0]|((uint64_t)h[1]<<26)|((uint64_t)h[2]<<52);
-    uint32_t t0=(uint32_t)f; f>>=32;
-    f|=(uint64_t)h[2]>>12|((uint64_t)h[3]<<14)|((uint64_t)h[4]<<40);
-    uint32_t t1=(uint32_t)f; f>>=32;
-    uint32_t t2=(uint32_t)((uint64_t)h[3]>>18|((uint64_t)h[4]<<8));
-    f=(uint64_t)t0+pad[0];
-    tag[0]=(uint8_t)f;tag[1]=(uint8_t)(f>>8);tag[2]=(uint8_t)(f>>16);tag[3]=(uint8_t)(f>>24);f>>=32;
-    f+=(uint64_t)t1+pad[1];
-    tag[4]=(uint8_t)f;tag[5]=(uint8_t)(f>>8);tag[6]=(uint8_t)(f>>16);tag[7]=(uint8_t)(f>>24);f>>=32;
-    f+=(uint64_t)t2+pad[2];
-    tag[8]=(uint8_t)f;tag[9]=(uint8_t)(f>>8);tag[10]=(uint8_t)(f>>16);tag[11]=(uint8_t)(f>>24);f>>=32;
-    f+=pad[3];
-    tag[12]=(uint8_t)f;tag[13]=(uint8_t)(f>>8);tag[14]=(uint8_t)(f>>16);tag[15]=(uint8_t)(f>>24);
-  }
-};
+// Shared CPU-only implementation; see tests/poly1305_test.cpp.
+// This primitive does not supply the caller's complete AEAD framing.
 
 // ─── Constant-time tag comparison ────────────────────────────────────────────
 

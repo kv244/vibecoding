@@ -6,7 +6,42 @@ GPU compute experiments using CUDA and Numba.
 
 ## `encrypt.cu` — GPU File Encryptor
 
-An industrial-strength file encryption tool using the GPU to accelerate the ChaCha20 keystream generation, with Argon2id key derivation and Poly1305 authentication.
+An experimental file encryption tool using the GPU to accelerate the ChaCha20 keystream generation, with Argon2id key derivation and Poly1305 authentication.
+
+> **Experimental, not security-audited.** The corrected Poly1305 primitive is
+> tested against RFC vectors, but the file-encryption application's complete
+> AEAD framing and file-safety issues remain unresolved. Passing the primitive
+> tests does not establish RFC 8439 AEAD compliance or production readiness.
+> Tags from the previous, incorrect implementation are not compatible with
+> this fix. Preserve existing encrypted files and their original tool; this
+> change does not provide a legacy-file migration path.
+
+### CPU-only Poly1305 regression tests
+
+These tests use the same `poly1305.hpp` included by `encrypt.cu`; they do not
+need CUDA, an NVIDIA GPU or Argon2. Run from the repository root:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+    experiments/gpu/tests/poly1305_test.cpp -o /tmp/poly1305-test
+/tmp/poly1305-test
+python3 experiments/gpu/tests/poly1305_reference_test.py
+```
+
+The C++ suite checks [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439)
+section 2.5.2 and Appendix A.3 vectors 1 and 5–11, all two-update splits,
+byte-at-a-time input, empty input and explicit AAD zero padding. The Python
+suite (Python 3.9+) compares random and boundary-length inputs with a separate
+arbitrary-precision implementation of the RFC definition.
+
+For memory and undefined-behaviour checks:
+
+```bash
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
+    -fno-omit-frame-pointer experiments/gpu/tests/poly1305_test.cpp \
+    -o /tmp/poly1305-sanitized
+/tmp/poly1305-sanitized
+```
 
 ### Security model
 

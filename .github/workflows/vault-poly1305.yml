@@ -1,0 +1,34 @@
+name: Vault Poly1305 CPU tests
+
+on:
+  push:
+    paths:
+      - 'experiments/gpu/encrypt.cu'
+      - 'experiments/gpu/poly1305.hpp'
+      - 'experiments/gpu/tests/**'
+      - '.github/workflows/vault-poly1305.yml'
+  pull_request:
+    paths:
+      - 'experiments/gpu/encrypt.cu'
+      - 'experiments/gpu/poly1305.hpp'
+      - 'experiments/gpu/tests/**'
+      - '.github/workflows/vault-poly1305.yml'
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: RFC vectors and streaming regressions
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic \
+            experiments/gpu/tests/poly1305_test.cpp -o /tmp/poly1305-test
+          /tmp/poly1305-test
+      - name: Address and undefined-behaviour sanitizers
+        run: |
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            experiments/gpu/tests/poly1305_test.cpp -o /tmp/poly1305-sanitized
+          /tmp/poly1305-sanitized
+      - name: Differential big-integer reference tests
+        run: python3 experiments/gpu/tests/poly1305_reference_test.py
